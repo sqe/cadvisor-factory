@@ -43,5 +43,10 @@ done
 
 make
 
+# Output some informational data to stdout
+ldd cadvisor || true
+ls -lah cadvisor
+./cadvisor --version
+
 mkdir -p "$DEPLOY_TO"
 mv cadvisor "$DEPLOY_TO"
