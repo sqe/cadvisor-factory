@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.org/aptible/cadvisory-factory.svg?branch=master)](https://travis-ci.org/aptible/cadvisor-factory)
+[![Build Status](https://travis-ci.org/aptible/cadvisor-factory.svg?branch=master)](https://travis-ci.org/aptible/cadvisor-factory)
 
 Automated build repository for cAdvisor.
 
