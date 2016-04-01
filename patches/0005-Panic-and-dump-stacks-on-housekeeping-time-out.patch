@@ -1,0 +1,58 @@
+From 00d2779f8899a27a8e7a5e1f294e14d3b99cc66e Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 1 Apr 2016 11:23:38 +0200
+Subject: [PATCH 1/1] Panic and dump stacks on housekeeping time out
+
+We'd rather have a process manager restart the entire cAdvisor process
+rather than stop reporting altogether for a given container (which is
+somewhat hard to debug otherwise).
+---
+ manager/container.go | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/manager/container.go b/manager/container.go
+index b1d8d33..baae002 100644
+--- a/manager/container.go
++++ b/manager/container.go
+@@ -28,6 +28,8 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"time"
++	"runtime/pprof"
++	"os"
+ 
+ 	"github.com/google/cadvisor/cache/memory"
+ 	"github.com/google/cadvisor/collector"
+@@ -444,11 +446,26 @@ func (c *containerData) housekeeping() {
+ }
+ 
+ func (c *containerData) housekeepingTick() {
+-	err := c.updateStats()
+-	if err != nil {
+-		if c.allowErrorLogging() {
+-			glog.Infof("Failed to update stats for container \"%s\": %s", c.info.Name, err)
++	done := make(chan bool, 1)
++
++	go func() {
++		err := c.updateStats()
++		if err != nil {
++			if c.allowErrorLogging() {
++				glog.Infof("Failed to update stats for container \"%s\": %s", c.info.Name, err)
++			}
+ 		}
++		done <- true
++	}()
++
++	select {
++	case <-done:
++		// Nothing to do
++	case <-time.After(*HousekeepingInterval * 2):
++		// We timed out. Dump all goroutine stacks to facilitate troubleshooting, and panic.
++		glog.Errorf("Housekeeping timed out for container %s", c.info.Name)
++		pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
++		panic("Aborting!")
+ 	}
+ }
+ 
+-- 
+1.9.1
