@@ -7,6 +7,7 @@ addons:
     - build-essential
     - curl
 script:
+- BUILD_HOME="$TRAVIS_BUILD_DIR" ./install.sh
 - BUILD_HOME="$TRAVIS_BUILD_DIR" DEPLOY_TO="$TRAVIS_BUILD_DIR/deploy/$TRAVIS_REPO_SLUG/$TRAVIS_BRANCH" ./build.sh
 deploy:
   skip_cleanup: true
