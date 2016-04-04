@@ -1,0 +1,105 @@
+From 59f278fe9965a98a87dc18479000f3af4ce88536 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 1 Apr 2016 10:38:12 +0200
+Subject: [PATCH 1/1] Account for Memory RSS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+According to the cgroups documentation, the "true" resident stack size
+can be obtained by adding the "rss" and the "mapped_file" stats. This
+patch updates the accounting for RSS to do so (cAdvisor takes other
+liberties with kernel metrics to make them more userspace-like anyway),
+and updates the InfluxDB driver to report this stat instead of the
+memory working set.
+
+The reason for removing the memory working set is twofold:
+
+- First, we're not actually using it in the dashboard, and probably
+  never will, so it's god to save space.
+- Second, it can be a misleading metric. The "working set" as defined by
+  cAdvisor is the amount of memory on the kernel's "active" LRU memory
+  list (the Kernel actually exposes two counters: one for anonymous
+  pages — "regular" allocated memory — and one for file-backed memory —
+  i.e. caches). However, that number is just as much an artifact of the
+  process' usage patterns as it is an artifact of how the Kernel manages
+  those lists (which depends on *when* it moves pages from the active to
+  the inactive list, and *how many* it decides to move). Furthermore,
+  there's no guarantee that the memory on the inactive list can be
+  reclaimed (or that the memory on the active list could not be
+  reclaimed under memory pressure). Hence, the "working set" is
+  decidedly not an actionable metric for customers, and it's hardly
+  worth repoting.
+
+References:
+
++ https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
++ https://www.kernel.org/doc/gorman/html/understand/understand013.html
+---
+ container/libcontainer/helpers.go | 2 +-
+ storage/influxdb/influxdb.go      | 6 ++++--
+ storage/stdout/stdout.go          | 5 +++++
+ 3 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/container/libcontainer/helpers.go b/container/libcontainer/helpers.go
+index bcf2658..e3d3a09 100644
+--- a/container/libcontainer/helpers.go
++++ b/container/libcontainer/helpers.go
+@@ -382,7 +382,7 @@ func toContainerStats2(s *cgroups.Stats, ret *info.ContainerStats) {
+ 	ret.Memory.Usage = s.MemoryStats.Usage.Usage
+ 	ret.Memory.Failcnt = s.MemoryStats.Usage.Failcnt
+ 	ret.Memory.Cache = s.MemoryStats.Stats["cache"]
+-	ret.Memory.RSS = s.MemoryStats.Stats["rss"]
++	ret.Memory.RSS = s.MemoryStats.Stats["rss"] + s.MemoryStats.Stats["mapped_file"]
+ 	if v, ok := s.MemoryStats.Stats["pgfault"]; ok {
+ 		ret.Memory.ContainerData.Pgfault = v
+ 		ret.Memory.HierarchicalData.Pgfault = v
+diff --git a/storage/influxdb/influxdb.go b/storage/influxdb/influxdb.go
+index 82739b5..796be46 100644
+--- a/storage/influxdb/influxdb.go
++++ b/storage/influxdb/influxdb.go
+@@ -55,6 +55,8 @@ const (
+ 	serLoadAverage string = "load_average"
+ 	// Memory Usage
+ 	serMemoryUsage string = "memory_usage"
++	// RSS size
++	serMemoryRSS string = "memory_rss"
+ 	// Working set size
+ 	serMemoryWorkingSet string = "memory_working_set"
+ 	// Cumulative count of bytes received.
+@@ -194,8 +196,8 @@ func (self *influxdbStorage) containerStatsToPoints(
+ 	// Memory Usage
+ 	points = append(points, makePoint(serMemoryUsage, stats.Memory.Usage))
+ 
+-	// Working Set Size
+-	points = append(points, makePoint(serMemoryWorkingSet, stats.Memory.WorkingSet))
++	// RSS
++	points = append(points, makePoint(serMemoryRSS, stats.Memory.RSS))
+ 
+ 	// Network Stats
+ 	points = append(points, makePoint(serRxBytes, stats.Network.RxBytes))
+diff --git a/storage/stdout/stdout.go b/storage/stdout/stdout.go
+index aa8aafe..6c4e8e3 100644
+--- a/storage/stdout/stdout.go
++++ b/storage/stdout/stdout.go
+@@ -34,6 +34,8 @@ const (
+ 	colCpuCumulativeUsage = "cpu_cumulative_usage"
+ 	// Memory Usage
+ 	colMemoryUsage = "memory_usage"
++	// Memory RSS
++	colRSS = "rss"
+ 	// Working set size
+ 	colMemoryWorkingSet = "memory_working_set"
+ 	// Cumulative count of bytes received.
+@@ -65,6 +67,9 @@ func (driver *stdoutStorage) containerStatsToValues(stats *info.ContainerStats)
+ 	// Memory Usage
+ 	series[colMemoryUsage] = stats.Memory.Usage
+ 
++	// RSS
++	series[colRSS] = stats.Memory.RSS
++
+ 	// Working set size
+ 	series[colMemoryWorkingSet] = stats.Memory.WorkingSet
+ 
+-- 
+1.9.1
