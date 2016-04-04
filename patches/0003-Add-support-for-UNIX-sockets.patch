@@ -1,3 +1,12 @@
+From b0b131b72ee9f5489a187714e464856dfa927beb Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Wed, 30 Mar 2016 10:17:58 +0200
+Subject: [PATCH 3/7] Add support for UNIX sockets
+
+---
+ cadvisor.go | 41 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 35 insertions(+), 6 deletions(-)
+
 diff --git a/cadvisor.go b/cadvisor.go
 index 6f6a0ad..5cd4f89 100644
 --- a/cadvisor.go
@@ -82,3 +91,6 @@ index 6f6a0ad..5cd4f89 100644
  		glog.Infof("Exiting given signal: %v", sig)
  		os.Exit(0)
  	}()
+-- 
+1.9.1
+

@@ -1,27 +1,39 @@
+From 3d064720a27e6ec14f5b282eacfd3a62867e02c8 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Thu, 31 Mar 2016 23:36:08 +0200
+Subject: [PATCH 4/7] Don't allocate 4GB of memory on netlink conn
+
+---
+ utils/cpuload/netlink/conn.go    |  8 ++++++++
+ utils/cpuload/netlink/defs.go    | 14 +++++++++++---
+ utils/cpuload/netlink/netlink.go | 20 +++++---------------
+ 3 files changed, 24 insertions(+), 18 deletions(-)
+
 diff --git a/utils/cpuload/netlink/conn.go b/utils/cpuload/netlink/conn.go
-index 7eb2204..5b1a58f 100644
+index 7eb2204..cd7cc4e 100644
 --- a/utils/cpuload/netlink/conn.go
 +++ b/utils/cpuload/netlink/conn.go
-@@ -20,6 +20,9 @@ import (
+@@ -18,8 +18,11 @@ import (
+ 	"bufio"
+ 	"bytes"
  	"encoding/binary"
++	"errors"
  	"os"
  	"syscall"
-+	"errors"
 +
 +	"github.com/golang/glog"
  )
  
  type Connection struct {
-@@ -52,6 +55,8 @@ func newConnection() (*Connection, error) {
+@@ -52,6 +55,7 @@ func newConnection() (*Connection, error) {
  		syscall.Close(fd)
  		return nil, err
  	}
-+
 +	glog.V(4).Infof("New Netlink connection: %+v", conn)
  	return conn, err
  }
  
-@@ -89,6 +94,10 @@ func (self *Connection) ReadMessage() (msg syscall.NetlinkMessage, err error) {
+@@ -89,6 +93,10 @@ func (self *Connection) ReadMessage() (msg syscall.NetlinkMessage, err error) {
  	if err != nil {
  		return msg, err
  	}
@@ -33,7 +45,7 @@ index 7eb2204..5b1a58f 100644
  	_, err = self.rbuf.Read(msg.Data)
  	return msg, err
 diff --git a/utils/cpuload/netlink/defs.go b/utils/cpuload/netlink/defs.go
-index a45d870..cdb5517 100644
+index a45d870..0a6c7d0 100644
 --- a/utils/cpuload/netlink/defs.go
 +++ b/utils/cpuload/netlink/defs.go
 @@ -15,12 +15,20 @@
@@ -50,14 +62,14 @@ index a45d870..cdb5517 100644
 -
  const (
 -	__TASKSTATS_CMD_MAX = C.__TASKSTATS_CMD_MAX
-+	GENL_ID_CTRL = C.GENL_ID_CTRL
-+	CTRL_ATTR_FAMILY_ID = C.CTRL_ATTR_FAMILY_ID
-+	CTRL_ATTR_FAMILY_NAME = C.CTRL_ATTR_FAMILY_NAME
-+	CTRL_CMD_GETFAMILY = C.CTRL_CMD_GETFAMILY
-+	TASKSTATS_GENL_NAME = C.TASKSTATS_GENL_NAME
-+	TASKSTATS_GENL_VERSION = C.TASKSTATS_GENL_VERSION
-+	CGROUPSTATS_CMD_GET = C.CGROUPSTATS_CMD_GET
-+	CGROUPSTATS_CMD_ATTR_FD = C.CGROUPSTATS_CMD_ATTR_FD
++	GENL_ID_CTRL                  = C.GENL_ID_CTRL
++	CTRL_ATTR_FAMILY_ID           = C.CTRL_ATTR_FAMILY_ID
++	CTRL_ATTR_FAMILY_NAME         = C.CTRL_ATTR_FAMILY_NAME
++	CTRL_CMD_GETFAMILY            = C.CTRL_CMD_GETFAMILY
++	TASKSTATS_GENL_NAME           = C.TASKSTATS_GENL_NAME
++	TASKSTATS_GENL_VERSION        = C.TASKSTATS_GENL_VERSION
++	CGROUPSTATS_CMD_GET           = C.CGROUPSTATS_CMD_GET
++	CGROUPSTATS_CMD_ATTR_FD       = C.CGROUPSTATS_CMD_ATTR_FD
 +	CGROUPSTATS_TYPE_CGROUP_STATS = C.CGROUPSTATS_TYPE_CGROUP_STATS
  )
 diff --git a/utils/cpuload/netlink/netlink.go b/utils/cpuload/netlink/netlink.go
@@ -110,53 +122,6 @@ index 7ca05f3..accf294 100644
  			err = binary.Read(buf, Endian, &id)
  			if err != nil {
  				return 0, err
-diff --git a/utils/cpuload/netlink/reader.go b/utils/cpuload/netlink/reader.go
-index 4e3aa68..9ed93f9 100644
---- a/utils/cpuload/netlink/reader.go
-+++ b/utils/cpuload/netlink/reader.go
-@@ -25,7 +25,6 @@ import (
- 
- type NetlinkReader struct {
- 	familyId uint16
--	conn     *Connection
- }
- 
- func New() (*NetlinkReader, error) {
-@@ -33,6 +32,7 @@ func New() (*NetlinkReader, error) {
- 	if err != nil {
- 		return nil, fmt.Errorf("failed to create a new connection: %s", err)
- 	}
-+	defer conn.Close()
- 
- 	id, err := getFamilyId(conn)
- 	if err != nil {
-@@ -41,14 +41,10 @@ func New() (*NetlinkReader, error) {
- 	glog.V(4).Infof("Family id for taskstats: %d", id)
- 	return &NetlinkReader{
- 		familyId: id,
--		conn:     conn,
- 	}, nil
- }
- 
- func (self *NetlinkReader) Stop() {
--	if self.conn != nil {
--		self.conn.Close()
--	}
- }
- 
- func (self *NetlinkReader) Start() error {
-@@ -70,7 +66,13 @@ func (self *NetlinkReader) GetCpuLoad(name string, path string) (info.LoadStats,
- 		return info.LoadStats{}, fmt.Errorf("failed to open cgroup path %s: %q", path, err)
- 	}
- 
--	stats, err := getLoadStats(self.familyId, cfd.Fd(), self.conn)
-+	conn, err := newConnection()
-+	if err != nil {
-+		return info.LoadStats{}, fmt.Errorf("failed to create a new connection: %s", err)
-+	}
-+	defer conn.Close()
-+
-+	stats, err := getLoadStats(self.familyId, cfd.Fd(), conn)
- 	if err != nil {
- 		return info.LoadStats{}, err
- 	}
+-- 
+1.9.1
+

@@ -1,0 +1,27 @@
+From 18e4b9afe10d26309427c55c07bc7342ad783a29 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Mon, 4 Apr 2016 17:56:53 +0200
+Subject: [PATCH 6/7] Include uninterruptible and IO wait tasks in LA
+
+Otherwise, the load average doesn't report tasks stuck on IO (which is
+counter-intuitive to the concept of the load average).
+---
+ manager/container.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/manager/container.go b/manager/container.go
+index baae002..dffd50f 100644
+--- a/manager/container.go
++++ b/manager/container.go
+@@ -527,7 +527,7 @@ func (c *containerData) updateStats() error {
+ 				return fmt.Errorf("failed to get load stat for %q - path %q, error %s", c.info.Name, path, err)
+ 			}
+ 			stats.TaskStats = loadStats
+-			c.updateLoad(loadStats.NrRunning)
++			c.updateLoad(loadStats.NrRunning + loadStats.NrUninterruptible + loadStats.NrIoWait)
+ 			// convert to 'milliLoad' to avoid floats and preserve precision.
+ 			stats.Cpu.LoadAverage = int32(c.loadAvg * 1000)
+ 		}
+-- 
+1.9.1
+
