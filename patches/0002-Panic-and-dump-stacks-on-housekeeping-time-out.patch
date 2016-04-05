@@ -1,7 +1,7 @@
-From 00d2779f8899a27a8e7a5e1f294e14d3b99cc66e Mon Sep 17 00:00:00 2001
+From 18d4b36a15c9dd3137e71b7eb3e31f80f6797b25 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Fri, 1 Apr 2016 11:23:38 +0200
-Subject: [PATCH 1/1] Panic and dump stacks on housekeeping time out
+Subject: [PATCH 2/7] Panic and dump stacks on housekeeping time out
 
 We'd rather have a process manager restart the entire cAdvisor process
 rather than stop reporting altogether for a given container (which is
@@ -56,3 +56,4 @@ index b1d8d33..baae002 100644
  
 -- 
 1.9.1
+

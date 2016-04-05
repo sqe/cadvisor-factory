@@ -1,0 +1,201 @@
+From 478fe7627aecac7e51822588dd3a623e44f0d533 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Mon, 4 Apr 2016 20:57:34 +0200
+Subject: [PATCH 7/7] Use a dedicated CpuLoadReader per container
+
+This ensures each goroutine is given its own Netlink connection, and
+presumably avoids having a message destined for one goroutine read by
+another goroutine.
+---
+ manager/container.go      | 27 +++++++++++++++++++++++----
+ manager/container_test.go |  2 +-
+ manager/manager.go        | 25 +------------------------
+ manager/manager_test.go   |  2 +-
+ utils/cpuload/cpuload.go  |  2 +-
+ 5 files changed, 27 insertions(+), 31 deletions(-)
+
+diff --git a/manager/container.go b/manager/container.go
+index dffd50f..2384a3a 100644
+--- a/manager/container.go
++++ b/manager/container.go
+@@ -44,6 +44,7 @@ import (
+ )
+ 
+ // Housekeeping interval.
++var enableLoadReader = flag.Bool("enable_load_reader", false, "Whether to enable cpu load reader")
+ var HousekeepingInterval = flag.Duration("housekeeping_interval", 1*time.Second, "Interval between container housekeepings")
+ 
+ var cgroupPathRegExp = regexp.MustCompile(`devices[^:]*:(.*?)[,;$]`)
+@@ -305,7 +306,7 @@ func (c *containerData) GetProcessList(cadvisorContainer string, inHostNamespace
+ 	return processes, nil
+ }
+ 
+-func newContainerData(containerName string, memoryCache *memory.InMemoryCache, handler container.ContainerHandler, loadReader cpuload.CpuLoadReader, logUsage bool, collectorManager collector.CollectorManager, maxHousekeepingInterval time.Duration, allowDynamicHousekeeping bool) (*containerData, error) {
++func newContainerData(containerName string, memoryCache *memory.InMemoryCache, handler container.ContainerHandler, logUsage bool, collectorManager collector.CollectorManager, maxHousekeepingInterval time.Duration, allowDynamicHousekeeping bool) (*containerData, error) {
+ 	if memoryCache == nil {
+ 		return nil, fmt.Errorf("nil memory storage")
+ 	}
+@@ -323,7 +324,6 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
+ 		housekeepingInterval:     *HousekeepingInterval,
+ 		maxHousekeepingInterval:  maxHousekeepingInterval,
+ 		allowDynamicHousekeeping: allowDynamicHousekeeping,
+-		loadReader:               loadReader,
+ 		logUsage:                 logUsage,
+ 		loadAvg:                  -1.0, // negative value indicates uninitialized.
+ 		stop:                     make(chan bool, 1),
+@@ -333,6 +333,17 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
+ 
+ 	cont.loadDecay = math.Exp(float64(-cont.housekeepingInterval.Seconds() / 10))
+ 
++	if *enableLoadReader {
++		// Create cpu load reader.
++		loadReader, err := cpuload.New()
++		if err != nil {
++			// TODO(rjnagal): Promote to warning once we support cpu load inside namespaces.
++			glog.Infof("Could not initialize cpu load reader for %q: %s", ref.Name, err)
++		} else {
++			cont.loadReader = loadReader
++		}
++	}
++
+ 	err = cont.updateSpec()
+ 	if err != nil {
+ 		return nil, err
+@@ -377,6 +388,16 @@ func (self *containerData) nextHousekeeping(lastHousekeeping time.Time) time.Tim
+ func (c *containerData) housekeeping() {
+ 	// Start any background goroutines - must be cleaned up in c.handler.Cleanup().
+ 	c.handler.Start()
++	defer c.handler.Cleanup()
++
++	// Initialize cpuload reader - must be cleaned up in c.loadReader.Stop()
++	if c.loadReader != nil {
++		err := c.loadReader.Start()
++		if err != nil {
++			glog.Warningf("Could not start cpu load stat collector for %q: %s", c.info.Name, err)
++		}
++		defer c.loadReader.Stop()
++	}
+ 
+ 	// Long housekeeping is either 100ms or half of the housekeeping interval.
+ 	longHousekeeping := 100 * time.Millisecond
+@@ -390,8 +411,6 @@ func (c *containerData) housekeeping() {
+ 	for {
+ 		select {
+ 		case <-c.stop:
+-			// Cleanup container resources before stopping housekeeping.
+-			c.handler.Cleanup()
+ 			// Stop housekeeping when signaled.
+ 			return
+ 		default:
+diff --git a/manager/container_test.go b/manager/container_test.go
+index 27b18d8..9bfee56 100644
+--- a/manager/container_test.go
++++ b/manager/container_test.go
+@@ -42,7 +42,7 @@ func setupContainerData(t *testing.T, spec info.ContainerSpec) (*containerData,
+ 		nil,
+ 	)
+ 	memoryCache := memory.New(60, nil)
+-	ret, err := newContainerData(containerName, memoryCache, mockHandler, nil, false, &collector.GenericCollectorManager{}, 60*time.Second, true)
++	ret, err := newContainerData(containerName, memoryCache, mockHandler, false, &collector.GenericCollectorManager{}, 60*time.Second, true)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/manager/manager.go b/manager/manager.go
+index eb8d2cb..701b22c 100644
+--- a/manager/manager.go
++++ b/manager/manager.go
+@@ -35,7 +35,6 @@ import (
+ 	"github.com/google/cadvisor/fs"
+ 	info "github.com/google/cadvisor/info/v1"
+ 	"github.com/google/cadvisor/info/v2"
+-	"github.com/google/cadvisor/utils/cpuload"
+ 	"github.com/google/cadvisor/utils/oomparser"
+ 	"github.com/google/cadvisor/utils/sysfs"
+ 
+@@ -45,7 +44,6 @@ import (
+ 
+ var globalHousekeepingInterval = flag.Duration("global_housekeeping_interval", 1*time.Minute, "Interval between global housekeepings")
+ var logCadvisorUsage = flag.Bool("log_cadvisor_usage", false, "Whether to log the usage of the cAdvisor container")
+-var enableLoadReader = flag.Bool("enable_load_reader", false, "Whether to enable cpu load reader")
+ var eventStorageAgeLimit = flag.String("event_storage_age_limit", "default=24h", "Max length of time for which to store events (per type). Value is a comma separated list of key values, where the keys are event types (e.g.: creation, oom) or \"default\" and the value is a duration. Default is applied to all non-specified event types")
+ var eventStorageEventLimit = flag.String("event_storage_event_limit", "default=100000", "Max number of events to store (per type). Value is a comma separated list of key values, where the keys are event types (e.g.: creation, oom) or \"default\" and the value is an integer. Default is applied to all non-specified event types")
+ var applicationMetricsCountLimit = flag.Int("application_metrics_count_limit", 100, "Max number of application metrics to store (per container)")
+@@ -196,7 +194,6 @@ type manager struct {
+ 	quitChannels             []chan error
+ 	cadvisorContainer        string
+ 	inHostNamespace          bool
+-	loadReader               cpuload.CpuLoadReader
+ 	eventHandler             events.EventManager
+ 	startupTime              time.Time
+ 	maxHousekeepingInterval  time.Duration
+@@ -221,22 +218,6 @@ func (self *manager) Start() error {
+ 	self.DockerInfo()
+ 	self.DockerImages()
+ 
+-	if *enableLoadReader {
+-		// Create cpu load reader.
+-		cpuLoadReader, err := cpuload.New()
+-		if err != nil {
+-			// TODO(rjnagal): Promote to warning once we support cpu load inside namespaces.
+-			glog.Infof("Could not initialize cpu load reader: %s", err)
+-		} else {
+-			err = cpuLoadReader.Start()
+-			if err != nil {
+-				glog.Warningf("Could not start cpu load stat collector: %s", err)
+-			} else {
+-				self.loadReader = cpuLoadReader
+-			}
+-		}
+-	}
+-
+ 	// Watch for OOMs.
+ 	err = self.watchForNewOoms()
+ 	if err != nil {
+@@ -289,10 +270,6 @@ func (self *manager) Stop() error {
+ 		}
+ 	}
+ 	self.quitChannels = make([]chan error, 0, 2)
+-	if self.loadReader != nil {
+-		self.loadReader.Stop()
+-		self.loadReader = nil
+-	}
+ 	return nil
+ }
+ 
+@@ -777,7 +754,7 @@ func (m *manager) createContainer(containerName string) error {
+ 	}
+ 
+ 	logUsage := *logCadvisorUsage && containerName == m.cadvisorContainer
+-	cont, err := newContainerData(containerName, m.memoryCache, handler, m.loadReader, logUsage, collectorManager, m.maxHousekeepingInterval, m.allowDynamicHousekeeping)
++	cont, err := newContainerData(containerName, m.memoryCache, handler, logUsage, collectorManager, m.maxHousekeepingInterval, m.allowDynamicHousekeeping)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/manager/manager_test.go b/manager/manager_test.go
+index cc426a5..78a154e 100644
+--- a/manager/manager_test.go
++++ b/manager/manager_test.go
+@@ -53,7 +53,7 @@ func createManagerAndAddContainers(
+ 			spec,
+ 			nil,
+ 		).Once()
+-		cont, err := newContainerData(name, memoryCache, mockHandler, nil, false, &collector.GenericCollectorManager{}, 60*time.Second, true)
++		cont, err := newContainerData(name, memoryCache, mockHandler, false, &collector.GenericCollectorManager{}, 60*time.Second, true)
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+diff --git a/utils/cpuload/cpuload.go b/utils/cpuload/cpuload.go
+index 78b2592..e536d90 100644
+--- a/utils/cpuload/cpuload.go
++++ b/utils/cpuload/cpuload.go
+@@ -41,6 +41,6 @@ func New() (CpuLoadReader, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create a netlink based cpuload reader: %v", err)
+ 	}
+-	glog.Info("Using a netlink-based load reader")
++	glog.V(3).Info("Using a netlink-based load reader")
+ 	return reader, nil
+ }
+-- 
+1.9.1
+
