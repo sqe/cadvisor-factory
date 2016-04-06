@@ -21,4 +21,5 @@ done
 make
 
 mkdir -p "$DEPLOY_TO"
+sha1sum cadvisor > "${DEPLOY_TO}/cadvisor.sha1sum"
 mv cadvisor "$DEPLOY_TO"
