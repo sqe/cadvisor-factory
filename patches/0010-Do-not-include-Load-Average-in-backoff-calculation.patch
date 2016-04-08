@@ -1,0 +1,28 @@
+From 03a61a55a1fd5afb045aa6a82754305a13b141ed Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Tue, 5 Apr 2016 15:50:30 +0200
+Subject: [PATCH] Do not include Load Average in backoff calculation
+
+---
+ info/v1/container.go | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/info/v1/container.go b/info/v1/container.go
+index 6e7e658..74c719e 100644
+--- a/info/v1/container.go
++++ b/info/v1/container.go
+@@ -520,7 +520,10 @@ func (a *ContainerStats) Eq(b *ContainerStats) bool {
+ // Checks equality of the stats values.
+ func (a *ContainerStats) StatsEq(b *ContainerStats) bool {
+ 	// TODO(vmarmol): Consider using this through reflection.
+-	if !reflect.DeepEqual(a.Cpu, b.Cpu) {
++	// Exclude Load Average from calculation. Since the Load Average
++	// is adjusted at each run via a calculation that is bound to make
++	// it change over time.
++	if !reflect.DeepEqual(a.Cpu.Usage, b.Cpu.Usage) {
+ 		return false
+ 	}
+ 	if !reflect.DeepEqual(a.Memory, b.Memory) {
+-- 
+2.7.4
+

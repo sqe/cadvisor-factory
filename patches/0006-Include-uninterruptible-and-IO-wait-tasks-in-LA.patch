@@ -1,7 +1,7 @@
 From 18e4b9afe10d26309427c55c07bc7342ad783a29 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 17:56:53 +0200
-Subject: [PATCH 6/7] Include uninterruptible and IO wait tasks in LA
+Subject: [PATCH] Include uninterruptible and IO wait tasks in LA
 
 Otherwise, the load average doesn't report tasks stuck on IO (which is
 counter-intuitive to the concept of the load average).
@@ -23,5 +23,5 @@ index baae002..dffd50f 100644
  			stats.Cpu.LoadAverage = int32(c.loadAvg * 1000)
  		}
 -- 
-1.9.1
+2.7.4
 

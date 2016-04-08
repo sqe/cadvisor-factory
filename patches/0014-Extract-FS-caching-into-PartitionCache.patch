@@ -1,0 +1,1850 @@
+From 497a2db2710fe77dfe751368daea90a2ab6606c7 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 8 Apr 2016 22:18:55 +0200
+Subject: [PATCH] Extract FS caching into PartitionCache
+
+Currently, the FsInfo module caches all mounts at startup, and never
+refreshes its cache, which means volumes that are mounted later on will
+be missed.
+
+This updates FsInfo to use a separate PartitionCache that is refreshed
+when the PartitionCache is queried for information it doesn't have but
+is likely to be the result of a stale cache.
+---
+ fs/dmsetup_helper.go       |  82 ++++++++
+ fs/dmsetup_helper_test.go  |  85 ++++++++
+ fs/fs.go                   | 303 ++++------------------------
+ fs/fs_test.go              | 293 ---------------------------
+ fs/mount_helper.go         |  32 +++
+ fs/partition_cache.go      | 342 +++++++++++++++++++++++++++++++
+ fs/partition_cache_test.go | 487 +++++++++++++++++++++++++++++++++++++++++++++
+ fs/types.go                |  21 ++
+ 8 files changed, 1086 insertions(+), 559 deletions(-)
+ create mode 100644 fs/dmsetup_helper.go
+ create mode 100644 fs/dmsetup_helper_test.go
+ create mode 100644 fs/mount_helper.go
+ create mode 100644 fs/partition_cache.go
+ create mode 100644 fs/partition_cache_test.go
+
+diff --git a/fs/dmsetup_helper.go b/fs/dmsetup_helper.go
+new file mode 100644
+index 0000000..4124788
+--- /dev/null
++++ b/fs/dmsetup_helper.go
+@@ -0,0 +1,82 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build linux
++package fs
++
++import (
++	"fmt"
++	"os/exec"
++	"strconv"
++	"strings"
++)
++
++// dmsetupClient knows to to interact with dmsetup to retrieve information about devicemapper.
++type dmsetupClient interface {
++	table(poolName string) ([]byte, error)
++	//TODO add status(poolName string) ([]byte, error) and use it in getDMStats so we can unit test
++}
++
++// defaultDmsetupClient implements the standard behavior for interacting with dmsetup.
++type defaultDmsetupClient struct{}
++
++func (*defaultDmsetupClient) table(poolName string) ([]byte, error) {
++	return exec.Command("dmsetup", "table", poolName).Output()
++}
++
++func parseDMTable(dmTable string) (uint, uint, uint, error) {
++	dmTable = strings.Replace(dmTable, ":", " ", -1)
++	dmFields := strings.Fields(dmTable)
++
++	if len(dmFields) < 8 {
++		return 0, 0, 0, fmt.Errorf("Invalid dmsetup table output: %s", dmTable)
++	}
++
++	major, err := strconv.ParseUint(dmFields[5], 10, 32)
++	if err != nil {
++		return 0, 0, 0, err
++	}
++	minor, err := strconv.ParseUint(dmFields[6], 10, 32)
++	if err != nil {
++		return 0, 0, 0, err
++	}
++	dataBlkSize, err := strconv.ParseUint(dmFields[7], 10, 32)
++	if err != nil {
++		return 0, 0, 0, err
++	}
++
++	return uint(major), uint(minor), uint(dataBlkSize), nil
++}
++
++func parseDMStatus(dmStatus string) (uint64, uint64, error) {
++	dmStatus = strings.Replace(dmStatus, "/", " ", -1)
++	dmFields := strings.Fields(dmStatus)
++
++	if len(dmFields) < 8 {
++		return 0, 0, fmt.Errorf("Invalid dmsetup status output: %s", dmStatus)
++	}
++
++	used, err := strconv.ParseUint(dmFields[6], 10, 64)
++	if err != nil {
++		return 0, 0, err
++	}
++	total, err := strconv.ParseUint(dmFields[7], 10, 64)
++	if err != nil {
++		return 0, 0, err
++	}
++
++	return used, total, nil
++}
++
++var _ dmsetupClient = &defaultDmsetupClient{}
+diff --git a/fs/dmsetup_helper_test.go b/fs/dmsetup_helper_test.go
+new file mode 100644
+index 0000000..2b50dcc
+--- /dev/null
++++ b/fs/dmsetup_helper_test.go
+@@ -0,0 +1,85 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build linux
++package fs
++
++import (
++	"testing"
++)
++
++type testDmsetup struct {
++	data []byte
++	err  error
++}
++
++func (t *testDmsetup) table(poolName string) ([]byte, error) {
++	return t.data, t.err
++}
++
++var dmTableTests = []struct {
++	dmTable     string
++	major       uint
++	minor       uint
++	dataBlkSize uint
++	errExpected bool
++}{
++	{`0 409534464 thin-pool 253:6 253:7 128 32768 1 skip_block_zeroing`, 253, 7, 128, false},
++	{`0 409534464 thin-pool 253:6 258:9 512 32768 1 skip_block_zeroing otherstuff`, 258, 9, 512, false},
++	{`Invalid status line`, 0, 0, 0, false},
++}
++
++func TestParseDMTable(t *testing.T) {
++	for _, tt := range dmTableTests {
++		major, minor, dataBlkSize, err := parseDMTable(tt.dmTable)
++		if tt.errExpected && err != nil {
++			t.Errorf("parseDMTable(%q) expected error", tt.dmTable)
++		}
++		if major != tt.major {
++			t.Errorf("parseDMTable(%q) wrong major value => %q, want %q", tt.dmTable, major, tt.major)
++		}
++		if minor != tt.minor {
++			t.Errorf("parseDMTable(%q) wrong minor value => %q, want %q", tt.dmTable, minor, tt.minor)
++		}
++		if dataBlkSize != tt.dataBlkSize {
++			t.Errorf("parseDMTable(%q) wrong dataBlkSize value => %q, want %q", tt.dmTable, dataBlkSize, tt.dataBlkSize)
++		}
++	}
++}
++
++var dmStatusTests = []struct {
++	dmStatus    string
++	used        uint64
++	total       uint64
++	errExpected bool
++}{
++	{`0 409534464 thin-pool 64085 3705/4161600 88106/3199488 - rw no_discard_passdown queue_if_no_space -`, 88106, 3199488, false},
++	{`0 209715200 thin-pool 707 1215/524288 30282/1638400 - rw discard_passdown`, 30282, 1638400, false},
++	{`Invalid status line`, 0, 0, false},
++}
++
++func TestParseDMStatus(t *testing.T) {
++	for _, tt := range dmStatusTests {
++		used, total, err := parseDMStatus(tt.dmStatus)
++		if tt.errExpected && err != nil {
++			t.Errorf("parseDMStatus(%q) expected error", tt.dmStatus)
++		}
++		if used != tt.used {
++			t.Errorf("parseDMStatus(%q) wrong used value => %q, want %q", tt.dmStatus, used, tt.used)
++		}
++		if total != tt.total {
++			t.Errorf("parseDMStatus(%q) wrong total value => %q, want %q", tt.dmStatus, total, tt.total)
++		}
++	}
++}
+diff --git a/fs/fs.go b/fs/fs.go
+index d6e9e27..458d8c4 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -1,4 +1,4 @@
+-// Copyright 2014 Google Inc. All Rights Reserved.
++// Copyright 2014 Google Inc. All Rights Reserved.&
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -19,45 +19,23 @@ package fs
+ 
+ import (
+ 	"bufio"
+-	"encoding/json"
+ 	"fmt"
+ 	"io/ioutil"
+ 	"os"
+ 	"os/exec"
+ 	"path"
+-	"path/filepath"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/docker/docker/pkg/mount"
+ 	"github.com/golang/glog"
+ 	zfs "github.com/mistifyio/go-zfs"
+ )
+ 
+-const (
+-	LabelSystemRoot   = "root"
+-	LabelDockerImages = "docker-images"
+-)
+-
+-type partition struct {
+-	mountpoint string
+-	major      uint
+-	minor      uint
+-	fsType     string
+-	blockSize  uint
+-}
+-
+ type RealFsInfo struct {
+-	// Map from block device path to partition information.
+-	partitions map[string]partition
+-	// Map from label to block device path.
+-	// Labels are intent-specific tags that are auto-detected.
+-	labels map[string]string
+-
+-	dmsetup dmsetupClient
++	partitionCache PartitionCache
+ }
+ 
+ type Context struct {
+@@ -67,169 +45,40 @@ type Context struct {
+ }
+ 
+ func NewFsInfo(context Context) (FsInfo, error) {
+-	mounts, err := mount.GetMounts()
+-	if err != nil {
+-		return nil, err
+-	}
+ 	fsInfo := &RealFsInfo{
+-		partitions: make(map[string]partition, 0),
+-		labels:     make(map[string]string, 0),
+-		dmsetup:    &defaultDmsetupClient{},
+-	}
+-	supportedFsType := map[string]bool{
+-		// all ext systems are checked through prefix.
+-		"btrfs": true,
+-		"xfs":   true,
+-		"zfs":   true,
+-	}
+-	for _, mount := range mounts {
+-		var Fstype string
+-		if !strings.HasPrefix(mount.Fstype, "ext") && !supportedFsType[mount.Fstype] {
+-			continue
+-		}
+-		// Avoid bind mounts.
+-		if _, ok := fsInfo.partitions[mount.Source]; ok {
+-			continue
+-		}
+-		if mount.Fstype == "zfs" {
+-			Fstype = mount.Fstype
+-		}
+-		fsInfo.partitions[mount.Source] = partition{
+-			fsType:     Fstype,
+-			mountpoint: mount.Mountpoint,
+-			major:      uint(mount.Major),
+-			minor:      uint(mount.Minor),
+-		}
+-	}
+-
+-	// need to call this before the log line below printing out the partitions, as this function may
+-	// add a "partition" for devicemapper to fsInfo.partitions
+-	fsInfo.addDockerImagesLabel(context)
+-
+-	glog.Infof("Filesystem partitions: %+v", fsInfo.partitions)
+-	fsInfo.addSystemRootLabel()
+-	return fsInfo, nil
+-}
+-
+-// getDockerDeviceMapperInfo returns information about the devicemapper device and "partition" if
+-// docker is using devicemapper for its storage driver. If a loopback device is being used, don't
+-// return any information or error, as we want to report based on the actual partition where the
+-// loopback file resides, inside of the loopback file itself.
+-func (self *RealFsInfo) getDockerDeviceMapperInfo(dockerInfo map[string]string) (string, *partition, error) {
+-	if storageDriver, ok := dockerInfo["Driver"]; ok && storageDriver != DeviceMapper.String() {
+-		return "", nil, nil
+-	}
+-
+-	var driverStatus [][]string
+-	if err := json.Unmarshal([]byte(dockerInfo["DriverStatus"]), &driverStatus); err != nil {
+-		return "", nil, err
+-	}
+-
+-	dataLoopFile := dockerStatusValue(driverStatus, "Data loop file")
+-	if len(dataLoopFile) > 0 {
+-		return "", nil, nil
+-	}
+-
+-	dev, major, minor, blockSize, err := dockerDMDevice(driverStatus, self.dmsetup)
+-	if err != nil {
+-		return "", nil, err
++		partitionCache: NewPartitionCache(context),
+ 	}
+ 
+-	return dev, &partition{
+-		fsType:    DeviceMapper.String(),
+-		major:     major,
+-		minor:     minor,
+-		blockSize: blockSize,
+-	}, nil
+-}
+-
+-// addSystemRootLabel attempts to determine which device contains the mount for /.
+-func (self *RealFsInfo) addSystemRootLabel() {
+-	for src, p := range self.partitions {
+-		if p.mountpoint == "/" {
+-			if _, ok := self.labels[LabelSystemRoot]; !ok {
+-				self.labels[LabelSystemRoot] = src
+-			}
+-		}
+-	}
+-}
+-
+-// addDockerImagesLabel attempts to determine which device contains the mount for docker images.
+-func (self *RealFsInfo) addDockerImagesLabel(context Context) {
+-	dockerDev, dockerPartition, err := self.getDockerDeviceMapperInfo(context.DockerInfo)
+-	if err != nil {
+-		glog.Warningf("Could not get Docker devicemapper device: %v", err)
+-	}
+-	if len(dockerDev) > 0 && dockerPartition != nil {
+-		self.partitions[dockerDev] = *dockerPartition
+-		self.labels[LabelDockerImages] = dockerDev
+-	} else {
+-		dockerPaths := getDockerImagePaths(context)
+-
+-		for src, p := range self.partitions {
+-			self.updateDockerImagesPath(src, p.mountpoint, dockerPaths)
+-		}
+-	}
+-}
++	partitions := make([]partition, 0)
++	fsInfo.partitionCache.ApplyOverPartitions(func(_ string, p partition) error {
++		partitions = append(partitions, p)
++		return nil
++	})
+ 
+-// Generate a list of possible mount points for docker image management from the docker root directory.
+-// Right now, we look for each type of supported graph driver directories, but we can do better by parsing
+-// some of the context from `docker info`.
+-func getDockerImagePaths(context Context) []string {
+-	// TODO(rjnagal): Detect docker root and graphdriver directories from docker info.
+-	dockerRoot := context.DockerRoot
+-	dockerImagePaths := []string{}
+-	for _, dir := range []string{"devicemapper", "btrfs", "aufs", "overlay", "zfs"} {
+-		dockerImagePaths = append(dockerImagePaths, path.Join(dockerRoot, dir))
+-	}
+-	for dockerRoot != "/" && dockerRoot != "." {
+-		dockerImagePaths = append(dockerImagePaths, dockerRoot)
+-		dockerRoot = filepath.Dir(dockerRoot)
+-	}
+-	dockerImagePaths = append(dockerImagePaths, "/")
+-	return dockerImagePaths
+-}
++	glog.Infof("Filesystem partitions: %+v", partitions)
+ 
+-// This method compares the mountpoint with possible docker image mount points. If a match is found,
+-// docker images label is added to the partition.
+-func (self *RealFsInfo) updateDockerImagesPath(source string, mountpoint string, dockerImagePaths []string) {
+-	for _, v := range dockerImagePaths {
+-		if v == mountpoint {
+-			if i, ok := self.labels[LabelDockerImages]; ok {
+-				// pick the innermost mountpoint.
+-				mnt := self.partitions[i].mountpoint
+-				if len(mnt) < len(mountpoint) {
+-					self.labels[LabelDockerImages] = source
+-				}
+-			} else {
+-				self.labels[LabelDockerImages] = source
+-			}
+-		}
+-	}
++	return fsInfo, nil
+ }
+ 
+ func (self *RealFsInfo) GetDeviceForLabel(label string) (string, error) {
+-	dev, ok := self.labels[label]
+-	if !ok {
+-		return "", fmt.Errorf("non-existent label %q", label)
+-	}
+-	return dev, nil
++	return self.partitionCache.DeviceNameForLabel(label)
+ }
+ 
+ func (self *RealFsInfo) GetLabelsForDevice(device string) ([]string, error) {
+-	labels := []string{}
+-	for label, dev := range self.labels {
+-		if dev == device {
++	labels := make([]string, 0)
++	self.partitionCache.ApplyOverLabels(func(label string, deviceForLabel string) error {
++		if device == deviceForLabel {
+ 			labels = append(labels, label)
+ 		}
+-	}
++		return nil
++	})
+ 	return labels, nil
+ }
+ 
+ func (self *RealFsInfo) GetMountpointForDevice(dev string) (string, error) {
+-	p, ok := self.partitions[dev]
+-	if !ok {
+-		return "", fmt.Errorf("no partition info for device %q", dev)
++	p, err := self.partitionCache.PartitionForDevice(dev)
++	if err != nil {
++		return "", err
+ 	}
+ 	return p.mountpoint, nil
+ }
+@@ -241,7 +90,8 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for device, partition := range self.partitions {
++
++	self.partitionCache.ApplyOverPartitions(func(device string, partition partition) error {
+ 		_, hasMount := mountSet[partition.mountpoint]
+ 		_, hasDevice := deviceSet[device]
+ 		if mountSet == nil || (hasMount && !hasDevice) {
+@@ -260,6 +110,7 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
+ 				fs.Capacity, fs.Free, fs.Available, fs.Inodes, fs.InodesFree, err = getVfsStats(partition.mountpoint)
+ 				fs.Type = VFS
+ 			}
++
+ 			if err != nil {
+ 				glog.Errorf("Stat fs failed. Error: %v", err)
+ 			} else {
+@@ -273,7 +124,10 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
+ 				filesystems = append(filesystems, fs)
+ 			}
+ 		}
+-	}
++
++		return nil
++	})
++
+ 	return filesystems, nil
+ }
+ 
+@@ -352,12 +206,11 @@ func (self *RealFsInfo) GetDirFsDevice(dir string) (*DeviceInfo, error) {
+ 	}
+ 	major := major(buf.Dev)
+ 	minor := minor(buf.Dev)
+-	for device, partition := range self.partitions {
+-		if partition.major == major && partition.minor == minor {
+-			return &DeviceInfo{device, major, minor}, nil
+-		}
++	deviceInfo, err := self.partitionCache.DeviceInfoForMajorMinor(major, minor)
++	if err != nil {
++		return nil, err
+ 	}
+-	return nil, fmt.Errorf("could not find device with major: %d, minor: %d in cached partitions map", major, minor)
++	return deviceInfo, nil
+ }
+ 
+ func (self *RealFsInfo) GetDirUsage(dir string, timeout time.Duration) (uint64, error) {
+@@ -399,6 +252,13 @@ func (self *RealFsInfo) GetDirUsage(dir string, timeout time.Duration) (uint64,
+ 	return usageInKb * 1024, nil
+ }
+ 
++func (self *RealFsInfo) RefreshCache() {
++	err := self.partitionCache.Refresh()
++	if err != nil {
++		glog.Warningf("Failed to refresh partition cache: %s")
++	}
++}
++
+ func getVfsStats(path string) (total uint64, free uint64, avail uint64, inodes uint64, inodesFree uint64, err error) {
+ 	var s syscall.Statfs_t
+ 	if err = syscall.Statfs(path, &s); err != nil {
+@@ -412,75 +272,6 @@ func getVfsStats(path string) (total uint64, free uint64, avail uint64, inodes u
+ 	return total, free, avail, inodes, inodesFree, nil
+ }
+ 
+-func dockerStatusValue(status [][]string, target string) string {
+-	for _, v := range status {
+-		if len(v) == 2 && strings.ToLower(v[0]) == strings.ToLower(target) {
+-			return v[1]
+-		}
+-	}
+-	return ""
+-}
+-
+-// dmsetupClient knows to to interact with dmsetup to retrieve information about devicemapper.
+-type dmsetupClient interface {
+-	table(poolName string) ([]byte, error)
+-	//TODO add status(poolName string) ([]byte, error) and use it in getDMStats so we can unit test
+-}
+-
+-// defaultDmsetupClient implements the standard behavior for interacting with dmsetup.
+-type defaultDmsetupClient struct{}
+-
+-var _ dmsetupClient = &defaultDmsetupClient{}
+-
+-func (*defaultDmsetupClient) table(poolName string) ([]byte, error) {
+-	return exec.Command("dmsetup", "table", poolName).Output()
+-}
+-
+-// Devicemapper thin provisioning is detailed at
+-// https://www.kernel.org/doc/Documentation/device-mapper/thin-provisioning.txt
+-func dockerDMDevice(driverStatus [][]string, dmsetup dmsetupClient) (string, uint, uint, uint, error) {
+-	poolName := dockerStatusValue(driverStatus, "Pool Name")
+-	if len(poolName) == 0 {
+-		return "", 0, 0, 0, fmt.Errorf("Could not get dm pool name")
+-	}
+-
+-	out, err := dmsetup.table(poolName)
+-	if err != nil {
+-		return "", 0, 0, 0, err
+-	}
+-
+-	major, minor, dataBlkSize, err := parseDMTable(string(out))
+-	if err != nil {
+-		return "", 0, 0, 0, err
+-	}
+-
+-	return poolName, major, minor, dataBlkSize, nil
+-}
+-
+-func parseDMTable(dmTable string) (uint, uint, uint, error) {
+-	dmTable = strings.Replace(dmTable, ":", " ", -1)
+-	dmFields := strings.Fields(dmTable)
+-
+-	if len(dmFields) < 8 {
+-		return 0, 0, 0, fmt.Errorf("Invalid dmsetup status output: %s", dmTable)
+-	}
+-
+-	major, err := strconv.ParseUint(dmFields[5], 10, 32)
+-	if err != nil {
+-		return 0, 0, 0, err
+-	}
+-	minor, err := strconv.ParseUint(dmFields[6], 10, 32)
+-	if err != nil {
+-		return 0, 0, 0, err
+-	}
+-	dataBlkSize, err := strconv.ParseUint(dmFields[7], 10, 32)
+-	if err != nil {
+-		return 0, 0, 0, err
+-	}
+-
+-	return uint(major), uint(minor), uint(dataBlkSize), nil
+-}
+-
+ func getDMStats(poolName string, dataBlkSize uint) (uint64, uint64, uint64, error) {
+ 	out, err := exec.Command("dmsetup", "status", poolName).Output()
+ 	if err != nil {
+@@ -499,26 +290,6 @@ func getDMStats(poolName string, dataBlkSize uint) (uint64, uint64, uint64, erro
+ 	return total, free, free, nil
+ }
+ 
+-func parseDMStatus(dmStatus string) (uint64, uint64, error) {
+-	dmStatus = strings.Replace(dmStatus, "/", " ", -1)
+-	dmFields := strings.Fields(dmStatus)
+-
+-	if len(dmFields) < 8 {
+-		return 0, 0, fmt.Errorf("Invalid dmsetup status output: %s", dmStatus)
+-	}
+-
+-	used, err := strconv.ParseUint(dmFields[6], 10, 64)
+-	if err != nil {
+-		return 0, 0, err
+-	}
+-	total, err := strconv.ParseUint(dmFields[7], 10, 64)
+-	if err != nil {
+-		return 0, 0, err
+-	}
+-
+-	return used, total, nil
+-}
+-
+ // getZfstats returns ZFS mount stats using zfsutils
+ func getZfstats(poolName string) (uint64, uint64, uint64, error) {
+ 	dataset, err := zfs.GetDataset(poolName)
+diff --git a/fs/fs_test.go b/fs/fs_test.go
+index 850cf82..e9e4888 100644
+--- a/fs/fs_test.go
++++ b/fs/fs_test.go
+@@ -15,10 +15,8 @@
+ package fs
+ 
+ import (
+-	"errors"
+ 	"io/ioutil"
+ 	"os"
+-	"reflect"
+ 	"testing"
+ 	"time"
+ 
+@@ -103,294 +101,3 @@ func TestDirUsage(t *testing.T) {
+ 	as.NoError(err)
+ 	as.True(expectedSize <= size, "expected dir size to be at-least %d; got size: %d", expectedSize, size)
+ }
+-
+-var dmStatusTests = []struct {
+-	dmStatus    string
+-	used        uint64
+-	total       uint64
+-	errExpected bool
+-}{
+-	{`0 409534464 thin-pool 64085 3705/4161600 88106/3199488 - rw no_discard_passdown queue_if_no_space -`, 88106, 3199488, false},
+-	{`0 209715200 thin-pool 707 1215/524288 30282/1638400 - rw discard_passdown`, 30282, 1638400, false},
+-	{`Invalid status line`, 0, 0, false},
+-}
+-
+-func TestParseDMStatus(t *testing.T) {
+-	for _, tt := range dmStatusTests {
+-		used, total, err := parseDMStatus(tt.dmStatus)
+-		if tt.errExpected && err != nil {
+-			t.Errorf("parseDMStatus(%q) expected error", tt.dmStatus)
+-		}
+-		if used != tt.used {
+-			t.Errorf("parseDMStatus(%q) wrong used value => %q, want %q", tt.dmStatus, used, tt.used)
+-		}
+-		if total != tt.total {
+-			t.Errorf("parseDMStatus(%q) wrong total value => %q, want %q", tt.dmStatus, total, tt.total)
+-		}
+-	}
+-}
+-
+-var dmTableTests = []struct {
+-	dmTable     string
+-	major       uint
+-	minor       uint
+-	dataBlkSize uint
+-	errExpected bool
+-}{
+-	{`0 409534464 thin-pool 253:6 253:7 128 32768 1 skip_block_zeroing`, 253, 7, 128, false},
+-	{`0 409534464 thin-pool 253:6 258:9 512 32768 1 skip_block_zeroing otherstuff`, 258, 9, 512, false},
+-	{`Invalid status line`, 0, 0, 0, false},
+-}
+-
+-func TestParseDMTable(t *testing.T) {
+-	for _, tt := range dmTableTests {
+-		major, minor, dataBlkSize, err := parseDMTable(tt.dmTable)
+-		if tt.errExpected && err != nil {
+-			t.Errorf("parseDMTable(%q) expected error", tt.dmTable)
+-		}
+-		if major != tt.major {
+-			t.Errorf("parseDMTable(%q) wrong major value => %q, want %q", tt.dmTable, major, tt.major)
+-		}
+-		if minor != tt.minor {
+-			t.Errorf("parseDMTable(%q) wrong minor value => %q, want %q", tt.dmTable, minor, tt.minor)
+-		}
+-		if dataBlkSize != tt.dataBlkSize {
+-			t.Errorf("parseDMTable(%q) wrong dataBlkSize value => %q, want %q", tt.dmTable, dataBlkSize, tt.dataBlkSize)
+-		}
+-	}
+-}
+-
+-func TestAddSystemRootLabel(t *testing.T) {
+-	fsInfo := &RealFsInfo{
+-		labels: map[string]string{},
+-		partitions: map[string]partition{
+-			"/dev/mapper/vg_vagrant-lv_root": {
+-				mountpoint: "/",
+-			},
+-			"vg_vagrant-docker--pool": {
+-				mountpoint: "",
+-				fsType:     "devicemapper",
+-			},
+-		},
+-	}
+-
+-	fsInfo.addSystemRootLabel()
+-	if e, a := "/dev/mapper/vg_vagrant-lv_root", fsInfo.labels[LabelSystemRoot]; e != a {
+-		t.Errorf("expected %q, got %q", e, a)
+-	}
+-}
+-
+-type testDmsetup struct {
+-	data []byte
+-	err  error
+-}
+-
+-func (t *testDmsetup) table(poolName string) ([]byte, error) {
+-	return t.data, t.err
+-}
+-
+-func TestGetDockerDeviceMapperInfo(t *testing.T) {
+-	tests := []struct {
+-		name              string
+-		driver            string
+-		driverStatus      string
+-		dmsetupTable      string
+-		dmsetupTableError error
+-		expectedDevice    string
+-		expectedPartition *partition
+-		expectedError     bool
+-	}{
+-		{
+-			name:              "not devicemapper",
+-			driver:            "btrfs",
+-			expectedDevice:    "",
+-			expectedPartition: nil,
+-			expectedError:     false,
+-		},
+-		{
+-			name:              "error unmarshaling driver status",
+-			driver:            "devicemapper",
+-			driverStatus:      "{[[[asdf",
+-			expectedDevice:    "",
+-			expectedPartition: nil,
+-			expectedError:     true,
+-		},
+-		{
+-			name:              "loopback",
+-			driver:            "devicemapper",
+-			driverStatus:      `[["Data loop file","/var/lib/docker/devicemapper/devicemapper/data"]]`,
+-			expectedDevice:    "",
+-			expectedPartition: nil,
+-			expectedError:     false,
+-		},
+-		{
+-			name:              "missing pool name",
+-			driver:            "devicemapper",
+-			driverStatus:      `[[]]`,
+-			expectedDevice:    "",
+-			expectedPartition: nil,
+-			expectedError:     true,
+-		},
+-		{
+-			name:              "error invoking dmsetup",
+-			driver:            "devicemapper",
+-			driverStatus:      `[["Pool Name", "vg_vagrant-docker--pool"]]`,
+-			dmsetupTableError: errors.New("foo"),
+-			expectedDevice:    "",
+-			expectedPartition: nil,
+-			expectedError:     true,
+-		},
+-		{
+-			name:              "unable to parse dmsetup table",
+-			driver:            "devicemapper",
+-			driverStatus:      `[["Pool Name", "vg_vagrant-docker--pool"]]`,
+-			dmsetupTable:      "no data here!",
+-			expectedDevice:    "",
+-			expectedPartition: nil,
+-			expectedError:     true,
+-		},
+-		{
+-			name:           "happy path",
+-			driver:         "devicemapper",
+-			driverStatus:   `[["Pool Name", "vg_vagrant-docker--pool"]]`,
+-			dmsetupTable:   "0 53870592 thin-pool 253:2 253:3 1024 0 1 skip_block_zeroing",
+-			expectedDevice: "vg_vagrant-docker--pool",
+-			expectedPartition: &partition{
+-				fsType:    "devicemapper",
+-				major:     253,
+-				minor:     3,
+-				blockSize: 1024,
+-			},
+-			expectedError: false,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		fsInfo := &RealFsInfo{
+-			dmsetup: &testDmsetup{
+-				data: []byte(tt.dmsetupTable),
+-			},
+-		}
+-
+-		dockerInfo := map[string]string{
+-			"Driver":       tt.driver,
+-			"DriverStatus": tt.driverStatus,
+-		}
+-
+-		device, partition, err := fsInfo.getDockerDeviceMapperInfo(dockerInfo)
+-
+-		if tt.expectedError && err == nil {
+-			t.Errorf("%s: expected error but got nil", tt.name)
+-			continue
+-		}
+-		if !tt.expectedError && err != nil {
+-			t.Errorf("%s: unexpected error: %v", tt.name, err)
+-			continue
+-		}
+-
+-		if e, a := tt.expectedDevice, device; e != a {
+-			t.Errorf("%s: device: expected %q, got %q", tt.name, e, a)
+-		}
+-
+-		if e, a := tt.expectedPartition, partition; !reflect.DeepEqual(e, a) {
+-			t.Errorf("%s: partition: expected %#v, got %#v", tt.name, e, a)
+-		}
+-	}
+-}
+-
+-func TestAddDockerImagesLabel(t *testing.T) {
+-	tests := []struct {
+-		name                           string
+-		driver                         string
+-		driverStatus                   string
+-		dmsetupTable                   string
+-		getDockerDeviceMapperInfoError error
+-		partitions                     map[string]partition
+-		expectedDockerDevice           string
+-		expectedPartition              *partition
+-	}{
+-		{
+-			name:         "devicemapper, not loopback",
+-			driver:       "devicemapper",
+-			driverStatus: `[["Pool Name", "vg_vagrant-docker--pool"]]`,
+-			dmsetupTable: "0 53870592 thin-pool 253:2 253:3 1024 0 1 skip_block_zeroing",
+-			partitions: map[string]partition{
+-				"/dev/mapper/vg_vagrant-lv_root": {
+-					mountpoint: "/",
+-					fsType:     "devicemapper",
+-				},
+-			},
+-			expectedDockerDevice: "vg_vagrant-docker--pool",
+-			expectedPartition: &partition{
+-				fsType:    "devicemapper",
+-				major:     253,
+-				minor:     3,
+-				blockSize: 1024,
+-			},
+-		},
+-		{
+-			name:         "devicemapper, loopback on non-root partition",
+-			driver:       "devicemapper",
+-			driverStatus: `[["Data loop file","/var/lib/docker/devicemapper/devicemapper/data"]]`,
+-			partitions: map[string]partition{
+-				"/dev/mapper/vg_vagrant-lv_root": {
+-					mountpoint: "/",
+-					fsType:     "devicemapper",
+-				},
+-				"/dev/sdb1": {
+-					mountpoint: "/var/lib/docker/devicemapper",
+-				},
+-			},
+-			expectedDockerDevice: "/dev/sdb1",
+-		},
+-		{
+-			name: "multiple mounts - innermost check",
+-			partitions: map[string]partition{
+-				"/dev/sda1": {
+-					mountpoint: "/",
+-					fsType:     "ext4",
+-				},
+-				"/dev/sdb1": {
+-					mountpoint: "/var/lib/docker",
+-					fsType:     "ext4",
+-				},
+-				"/dev/sdb2": {
+-					mountpoint: "/var/lib/docker/btrfs",
+-					fsType:     "btrfs",
+-				},
+-			},
+-			expectedDockerDevice: "/dev/sdb2",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		fsInfo := &RealFsInfo{
+-			labels:     map[string]string{},
+-			partitions: tt.partitions,
+-			dmsetup: &testDmsetup{
+-				data: []byte(tt.dmsetupTable),
+-			},
+-		}
+-
+-		context := Context{
+-			DockerRoot: "/var/lib/docker",
+-			DockerInfo: map[string]string{
+-				"Driver":       tt.driver,
+-				"DriverStatus": tt.driverStatus,
+-			},
+-		}
+-
+-		fsInfo.addDockerImagesLabel(context)
+-
+-		if e, a := tt.expectedDockerDevice, fsInfo.labels[LabelDockerImages]; e != a {
+-			t.Errorf("%s: docker device: expected %q, got %q", tt.name, e, a)
+-		}
+-
+-		if tt.expectedPartition == nil {
+-			continue
+-		}
+-		if e, a := *tt.expectedPartition, fsInfo.partitions[tt.expectedDockerDevice]; !reflect.DeepEqual(e, a) {
+-			t.Errorf("%s: docker partition: expected %#v, got %#v", tt.name, e, a)
+-		}
+-	}
+-}
+diff --git a/fs/mount_helper.go b/fs/mount_helper.go
+new file mode 100644
+index 0000000..b1ca52f
+--- /dev/null
++++ b/fs/mount_helper.go
+@@ -0,0 +1,32 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build linux
++package fs
++
++import (
++	dockerMountInfo "github.com/docker/docker/pkg/mount"
++)
++
++type mountInfoClient interface {
++	GetMounts() ([]*dockerMountInfo.Info, error)
++}
++
++type defaultMountInfoClient struct{}
++
++func (*defaultMountInfoClient) GetMounts() ([]*dockerMountInfo.Info, error) {
++	return dockerMountInfo.GetMounts()
++}
++
++var _ mountInfoClient = &defaultMountInfoClient{}
+diff --git a/fs/partition_cache.go b/fs/partition_cache.go
+new file mode 100644
+index 0000000..45248e1
+--- /dev/null
++++ b/fs/partition_cache.go
+@@ -0,0 +1,342 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build linux
++package fs
++
++import (
++	"encoding/json"
++	"fmt"
++	"github.com/golang/glog"
++	"path"
++	"path/filepath"
++	"strings"
++	"sync"
++)
++
++const (
++	LabelSystemRoot   = "root"
++	LabelDockerImages = "docker-images"
++)
++
++type RealPartitionCache struct {
++	dmsetup   dmsetupClient
++	mountInfo mountInfoClient
++	// Docker configuration
++	context Context
++	// Map from block device path to partition information.
++	partitions map[string]partition
++	// Labels are intent-specific tags that are auto-detected.
++	labels map[string]string
++	// For operations on partitions and labels
++	lock sync.Mutex
++}
++
++func newPartitionCache(context Context, dmsetup dmsetupClient, mountInfo mountInfoClient) PartitionCache {
++	partitionCache := &RealPartitionCache{
++		context:    context,
++		dmsetup:    dmsetup,
++		mountInfo:  mountInfo,
++		partitions: make(map[string]partition),
++		labels:     make(map[string]string),
++	}
++	return partitionCache
++}
++
++func NewPartitionCache(context Context) PartitionCache {
++	return newPartitionCache(context, &defaultDmsetupClient{}, &defaultMountInfoClient{})
++}
++
++func (self *RealPartitionCache) updateCache(labels map[string]string, partitions map[string]partition) {
++	self.lock.Lock()
++	defer self.lock.Unlock()
++	self.labels = labels
++	self.partitions = partitions
++}
++
++func (self *RealPartitionCache) Clear() {
++	self.updateCache(make(map[string]string), make(map[string]partition))
++}
++
++func (self *RealPartitionCache) Refresh() error {
++	partitions := make(map[string]partition)
++	labels := make(map[string]string)
++
++	supportedFsType := map[string]bool{
++		// all ext systems are checked through prefix.
++		"btrfs": true,
++		"xfs":   true,
++		"zfs":   true,
++	}
++
++	mounts, err := self.mountInfo.GetMounts()
++	if err != nil {
++		return err
++	}
++	for _, mount := range mounts {
++		var Fstype string
++		if !strings.HasPrefix(mount.Fstype, "ext") && !supportedFsType[mount.Fstype] {
++			continue
++		}
++		// Avoid bind mounts.
++		if _, ok := partitions[mount.Source]; ok {
++			continue
++		}
++		if mount.Fstype == "zfs" {
++			Fstype = mount.Fstype // REVIEW: Is this correct?
++		}
++		partitions[mount.Source] = partition{
++			fsType:     Fstype,
++			mountpoint: mount.Mountpoint,
++			major:      uint(mount.Major),
++			minor:      uint(mount.Minor),
++		}
++	}
++
++	addDockerImagesLabel(self.context, self.dmsetup, labels, partitions)
++	addSystemRootLabel(labels, partitions)
++
++	self.updateCache(labels, partitions)
++	return nil
++}
++
++func (self *RealPartitionCache) ApplyOverPartitions(f func(d string, p partition) error) error {
++	if len(self.partitions) == 0 {
++		glog.Infof("Partition cache is empty: updating")
++		err := self.Refresh()
++		if err != nil {
++			return err
++		}
++	}
++
++	for device, partition := range self.partitions {
++		err := f(device, partition)
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (self *RealPartitionCache) ApplyOverLabels(f func(l string, d string) error) error {
++	if len(self.labels) == 0 {
++		glog.Infof("Partition cache is empty: updating")
++		err := self.Refresh()
++		if err != nil {
++			return err
++		}
++	}
++
++	for label, device := range self.labels {
++		err := f(label, device)
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (self *RealPartitionCache) PartitionForDevice(device string) (partition, error) {
++	p, ok := self.partitions[device]
++	if ok {
++		return p, nil
++	}
++
++	glog.Infof("Partition cache miss for device %q, refreshing partition cache", device)
++	err := self.Refresh()
++	if err != nil {
++		return partition{}, err
++	}
++
++	p, ok = self.partitions[device]
++	if ok {
++		return p, nil
++	}
++
++	return partition{}, fmt.Errorf("No partition for device %s", device)
++}
++
++func (self *RealPartitionCache) DeviceInfoForMajorMinor(major uint, minor uint) (*DeviceInfo, error) {
++	var ret *DeviceInfo = nil
++
++	err := self.ApplyOverPartitions(func(device string, partition partition) error {
++		if partition.major == major && partition.minor == minor {
++			ret = &DeviceInfo{
++				Device: device,
++				Major:  major,
++				Minor:  minor,
++			}
++		}
++		return nil
++	})
++
++	if err != nil {
++		return nil, err
++	}
++
++	if ret == nil {
++		return nil, fmt.Errorf("could not find device with major: %d, minor: %d in partition cache", major, minor)
++	}
++
++	return ret, nil
++}
++
++func (self *RealPartitionCache) DeviceNameForLabel(label string) (string, error) {
++	d, ok := self.labels[label]
++	if ok {
++		return d, nil
++	}
++
++	glog.Infof("Partition cache miss for label %q, refreshing partition cache", label)
++	err := self.Refresh()
++	if err != nil {
++		return "", err
++	}
++
++	d, ok = self.labels[label]
++	if ok {
++		return d, nil
++	}
++
++	return "", fmt.Errorf("No device for label %s", label)
++}
++
++// addSystemRootLabel attempts to determine which device contains the mount for /.
++func addSystemRootLabel(labels map[string]string, partitions map[string]partition) {
++	for src, p := range partitions {
++		if p.mountpoint == "/" {
++			if _, ok := labels[LabelSystemRoot]; !ok {
++				labels[LabelSystemRoot] = src
++			}
++		}
++	}
++}
++
++// addDockerImagesLabel attempts to determine which device contains the mount for docker images.
++func addDockerImagesLabel(context Context, dmsetup dmsetupClient, labels map[string]string, partitions map[string]partition) {
++	dockerDev, dockerPartition, err := getDockerDeviceMapperInfo(context.DockerInfo, dmsetup)
++	if err != nil {
++		glog.Warningf("Could not get Docker devicemapper device: %v", err)
++	}
++	if len(dockerDev) > 0 && dockerPartition != nil {
++		partitions[dockerDev] = *dockerPartition
++		labels[LabelDockerImages] = dockerDev
++	} else {
++		dockerPaths := getDockerImagePaths(context)
++
++		for src, p := range partitions {
++			updateDockerImagesPath(src, p.mountpoint, dockerPaths, labels, partitions)
++		}
++	}
++}
++
++// Generate a list of possible mount points for docker image management from the docker root directory.
++// Right now, we look for each type of supported graph driver directories, but we can do better by parsing
++// some of the context from `docker info`.
++func getDockerImagePaths(context Context) []string {
++	// TODO(rjnagal): Detect docker root and graphdriver directories from docker info.
++	dockerRoot := context.DockerRoot
++	dockerImagePaths := []string{}
++	for _, dir := range []string{"devicemapper", "btrfs", "aufs", "overlay", "zfs"} {
++		dockerImagePaths = append(dockerImagePaths, path.Join(dockerRoot, dir))
++	}
++	for dockerRoot != "/" && dockerRoot != "." {
++		dockerImagePaths = append(dockerImagePaths, dockerRoot)
++		dockerRoot = filepath.Dir(dockerRoot)
++	}
++	dockerImagePaths = append(dockerImagePaths, "/")
++	return dockerImagePaths
++}
++
++// This method compares the mountpoint with possible docker image mount points. If a match is found,
++// docker images label is added to the partition.
++func updateDockerImagesPath(source string, mountpoint string, dockerImagePaths []string, labels map[string]string, partitions map[string]partition) {
++	for _, v := range dockerImagePaths {
++		if v == mountpoint {
++			if i, ok := labels[LabelDockerImages]; ok {
++				// pick the innermost mountpoint.
++				mnt := partitions[i].mountpoint
++				if len(mnt) < len(mountpoint) {
++					labels[LabelDockerImages] = source
++				}
++			} else {
++				labels[LabelDockerImages] = source
++			}
++		}
++	}
++}
++
++// Devicemapper thin provisioning is detailed at
++// https://www.kernel.org/doc/Documentation/device-mapper/thin-provisioning.txt
++func dockerDMDevice(driverStatus [][]string, dmsetup dmsetupClient) (string, uint, uint, uint, error) {
++	poolName := dockerStatusValue(driverStatus, "Pool Name")
++	if len(poolName) == 0 {
++		return "", 0, 0, 0, fmt.Errorf("Could not get dm pool name")
++	}
++
++	out, err := dmsetup.table(poolName)
++	if err != nil {
++		return "", 0, 0, 0, err
++	}
++
++	major, minor, dataBlkSize, err := parseDMTable(string(out))
++	if err != nil {
++		return "", 0, 0, 0, err
++	}
++
++	return poolName, major, minor, dataBlkSize, nil
++}
++
++// getDockerDeviceMapperInfo returns information about the devicemapper device and "partition" if
++// docker is using devicemapper for its storage driver. If a loopback device is being used, don't
++// return any information or error, as we want to report based on the actual partition where the
++// loopback file resides, instead of the loopback file itself.
++func getDockerDeviceMapperInfo(dockerInfo map[string]string, dmsetup dmsetupClient) (string, *partition, error) {
++	if storageDriver, ok := dockerInfo["Driver"]; ok && storageDriver != DeviceMapper.String() {
++		return "", nil, nil
++	}
++
++	var driverStatus [][]string
++	if err := json.Unmarshal([]byte(dockerInfo["DriverStatus"]), &driverStatus); err != nil {
++		return "", nil, err
++	}
++
++	dataLoopFile := dockerStatusValue(driverStatus, "Data loop file")
++	if len(dataLoopFile) > 0 {
++		return "", nil, nil
++	}
++
++	dev, major, minor, blockSize, err := dockerDMDevice(driverStatus, dmsetup)
++	if err != nil {
++		return "", nil, err
++	}
++
++	return dev, &partition{
++		fsType:    DeviceMapper.String(),
++		major:     major,
++		minor:     minor,
++		blockSize: blockSize,
++	}, nil
++}
++
++func dockerStatusValue(status [][]string, target string) string {
++	for _, v := range status {
++		if len(v) == 2 && strings.ToLower(v[0]) == strings.ToLower(target) {
++			return v[1]
++		}
++	}
++	return ""
++}
+diff --git a/fs/partition_cache_test.go b/fs/partition_cache_test.go
+new file mode 100644
+index 0000000..b92ea58
+--- /dev/null
++++ b/fs/partition_cache_test.go
+@@ -0,0 +1,487 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package fs
++
++import (
++	"errors"
++	"fmt"
++	"github.com/stretchr/testify/assert"
++	"reflect"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	dockerMountInfo "github.com/docker/docker/pkg/mount"
++)
++
++type testMountInfoClient struct {
++	Calls  int
++	mounts []*dockerMountInfo.Info
++}
++
++func (self *testMountInfoClient) GetMounts() ([]*dockerMountInfo.Info, error) {
++	self.Calls += 1
++	if len(self.mounts) == 0 {
++		return nil, fmt.Errorf("No test mounts!")
++	}
++	return self.mounts, nil
++}
++
++func TestBaseCacheOperations(t *testing.T) {
++	as := assert.New(t)
++
++	// Prepare dummy mounts
++	mounts := []*dockerMountInfo.Info{
++		&dockerMountInfo.Info{
++			Major:      1,
++			Minor:      11,
++			Source:     "/dev/sda1",
++			Mountpoint: "/",
++			Fstype:     "ext4",
++		},
++		&dockerMountInfo.Info{
++			Major:      2,
++			Minor:      22,
++			Source:     "/dev/sdb1",
++			Mountpoint: "/var/lib/docker",
++			Fstype:     "xfs",
++		},
++		&dockerMountInfo.Info{
++			Major:      3,
++			Minor:      33,
++			Mountpoint: "/tmp",
++			Fstype:     "tmpfs",
++		},
++	}
++
++	mountInfoClient := &testMountInfoClient{
++		mounts: mounts,
++	}
++
++	partitionCache := newPartitionCache(Context{
++		DockerRoot: "/var/lib/docker",
++		DockerInfo: make(map[string]string),
++	}, &testDmsetup{}, mountInfoClient)
++
++	// PartitionForDevice should work
++	p1, err := partitionCache.PartitionForDevice("/dev/sda1")
++	as.NoError(err)
++	as.Equal(uint(1), p1.major)
++	as.Equal(uint(11), p1.minor)
++	as.Equal("/", p1.mountpoint)
++
++	p2, err := partitionCache.PartitionForDevice("/dev/sdb1")
++	as.NoError(err)
++	as.Equal(uint(2), p2.major)
++	as.Equal(uint(22), p2.minor)
++	as.Equal("/var/lib/docker", p2.mountpoint)
++
++	// DeviceInfoForMajorMinor should work as well
++	d1, err := partitionCache.DeviceInfoForMajorMinor(1, 11)
++	as.NoError(err)
++	as.Equal("/dev/sda1", d1.Device)
++	as.Equal(uint(1), d1.Major)
++	as.Equal(uint(11), d1.Minor)
++
++	d2, err := partitionCache.DeviceInfoForMajorMinor(2, 22)
++	as.NoError(err)
++	as.Equal("/dev/sdb1", d2.Device)
++
++	// tmpfs should be ignored
++	_, err = partitionCache.DeviceInfoForMajorMinor(3, 33)
++	as.Error(err)
++
++	// Check labels
++	d3, err := partitionCache.DeviceNameForLabel(LabelSystemRoot)
++	as.NoError(err)
++	as.Equal("/dev/sda1", d3)
++
++	d4, err := partitionCache.DeviceNameForLabel(LabelDockerImages)
++	as.NoError(err)
++	as.Equal("/dev/sdb1", d4)
++
++	// Test that the cache refreshes automatically when data is missing
++	var n int
++
++	baseCalls := mountInfoClient.Calls
++
++	partitionCache.Clear()
++	n = 0
++	partitionCache.ApplyOverPartitions(func(d string, p partition) error {
++		n += 1
++		return nil
++	})
++	as.Equal(2, n)
++	as.Equal(baseCalls+1, mountInfoClient.Calls)
++
++	partitionCache.Clear()
++	n = 0
++	partitionCache.ApplyOverLabels(func(l string, d string) error {
++		n += 1
++		return nil
++	})
++	as.Equal(2, n)
++	as.Equal(baseCalls+2, mountInfoClient.Calls)
++
++	partitionCache.Clear()
++	p, err := partitionCache.PartitionForDevice("/dev/sda1")
++	as.NoError(err)
++	as.Equal("/", p.mountpoint)
++	as.Equal(baseCalls+3, mountInfoClient.Calls)
++
++	partitionCache.Clear()
++	i, err := partitionCache.DeviceInfoForMajorMinor(1, 11)
++	as.NoError(err)
++	as.Equal("/dev/sda1", i.Device)
++	as.Equal(baseCalls+4, mountInfoClient.Calls)
++
++	partitionCache.Clear()
++	d, err := partitionCache.DeviceNameForLabel(LabelSystemRoot)
++	as.NoError(err)
++	as.Equal("/dev/sda1", d)
++	as.Equal(baseCalls+5, mountInfoClient.Calls)
++}
++
++func TestDeviceMapperLabelling(t *testing.T) {
++	as := assert.New(t)
++	mounts := []*dockerMountInfo.Info{
++		&dockerMountInfo.Info{
++			Major:      1,
++			Minor:      11,
++			Source:     "/dev/sda1",
++			Mountpoint: "/",
++			Fstype:     "ext4",
++		},
++	}
++
++	dockerInfo := map[string]string{
++		"Driver":       "devicemapper",
++		"DriverStatus": "[[\"Pool Name\", \"thin-pool\"]]",
++	}
++
++	partitionCache := newPartitionCache(Context{
++		DockerRoot: "/var/lib/docker",
++		DockerInfo: dockerInfo,
++	}, &testDmsetup{
++		data: []byte("0 409534464 thin-pool 253:6 2:22 128 32768 1 skip_block_zeroing"),
++		err:  nil,
++	}, &testMountInfoClient{
++		mounts: mounts,
++	})
++
++	// Check that we get the right devices back via major / minor
++	d1, err := partitionCache.DeviceInfoForMajorMinor(2, 22)
++	as.NoError(err)
++	as.Equal("thin-pool", d1.Device)
++
++	d2, err := partitionCache.DeviceInfoForMajorMinor(1, 11)
++	as.NoError(err)
++	as.Equal("/dev/sda1", d2.Device)
++
++	// Check that the Docker images label is properly applied
++	d3, err := partitionCache.DeviceNameForLabel(LabelDockerImages)
++	as.NoError(err)
++	as.Equal("thin-pool", d3)
++
++	// Verify that the partition exists as well
++	p, err := partitionCache.PartitionForDevice("thin-pool")
++	as.NoError(err)
++	as.Equal("devicemapper", p.fsType)
++	as.Equal(uint(128), p.blockSize)
++}
++
++type raceMounts struct {
++	i int32
++}
++
++func (self *raceMounts) GetMounts() ([]*dockerMountInfo.Info, error) {
++	i := atomic.AddInt32(&self.i, 1)
++
++	mounts := make([]*dockerMountInfo.Info, i)
++
++	var j int32
++	for j = 0; j < i; j++ {
++		mounts[j] = &dockerMountInfo.Info{
++			Major:      int(j),
++			Minor:      int(j * 10),
++			Source:     fmt.Sprintf("%d", i),
++			Mountpoint: fmt.Sprintf("%d", j),
++			Fstype:     "ext4",
++		}
++	}
++
++	return mounts, nil
++}
++
++func TestPartitionCacheRefreshRaces(t *testing.T) {
++	as := assert.New(t)
++	n := 100
++
++	partitionCache := newPartitionCache(Context{
++		DockerRoot: "/var/lib/docker",
++		DockerInfo: make(map[string]string),
++	}, &testDmsetup{}, &raceMounts{i: 0})
++
++	wg := &sync.WaitGroup{}
++	wg.Add(n)
++
++	for i := 0; i < n; i++ {
++		go func() {
++			defer wg.Done()
++			partitionCache.Refresh()
++		}()
++	}
++
++	wg.Wait()
++
++	// We can largely rely on the data race detector to throw an error here,
++	// but it's still worth checking that all the partitions that were added
++	// via the same update (by checking the device, which we set to i.
++	var last string
++	err := partitionCache.ApplyOverPartitions(func(d string, _ partition) error {
++		if len(last) == 0 {
++			last = d
++			return nil
++		}
++
++		if last != d {
++			return fmt.Errorf("Race (mismatched sources): %s, %s", last, d)
++		}
++
++		return nil
++	})
++
++	as.NoError(err)
++}
++
++func TestAddSystemRootLabel(t *testing.T) {
++	labels := map[string]string{}
++	partitions := map[string]partition{
++		"/dev/mapper/vg_vagrant-lv_root": {
++			mountpoint: "/",
++		},
++		"vg_vagrant-docker--pool": {
++			mountpoint: "",
++			fsType:     "devicemapper",
++		},
++	}
++
++	addSystemRootLabel(labels, partitions)
++	if e, a := "/dev/mapper/vg_vagrant-lv_root", labels[LabelSystemRoot]; e != a {
++		t.Errorf("expected %q, got %q", e, a)
++	}
++}
++
++func TestAddDockerImagesLabel(t *testing.T) {
++	tests := []struct {
++		name                           string
++		driver                         string
++		driverStatus                   string
++		dmsetupTable                   string
++		getDockerDeviceMapperInfoError error
++		partitions                     map[string]partition
++		expectedDockerDevice           string
++		expectedPartition              *partition
++	}{
++		{
++			name:         "devicemapper, not loopback",
++			driver:       "devicemapper",
++			driverStatus: `[["Pool Name", "vg_vagrant-docker--pool"]]`,
++			dmsetupTable: "0 53870592 thin-pool 253:2 253:3 1024 0 1 skip_block_zeroing",
++			partitions: map[string]partition{
++				"/dev/mapper/vg_vagrant-lv_root": {
++					mountpoint: "/",
++					fsType:     "devicemapper",
++				},
++			},
++			expectedDockerDevice: "vg_vagrant-docker--pool",
++			expectedPartition: &partition{
++				fsType:    "devicemapper",
++				major:     253,
++				minor:     3,
++				blockSize: 1024,
++			},
++		},
++		{
++			name:         "devicemapper, loopback on non-root partition",
++			driver:       "devicemapper",
++			driverStatus: `[["Data loop file","/var/lib/docker/devicemapper/devicemapper/data"]]`,
++			partitions: map[string]partition{
++				"/dev/mapper/vg_vagrant-lv_root": {
++					mountpoint: "/",
++					fsType:     "devicemapper",
++				},
++				"/dev/sdb1": {
++					mountpoint: "/var/lib/docker/devicemapper",
++				},
++			},
++			expectedDockerDevice: "/dev/sdb1",
++		},
++		{
++			name: "multiple mounts - innermost check",
++			partitions: map[string]partition{
++				"/dev/sda1": {
++					mountpoint: "/",
++					fsType:     "ext4",
++				},
++				"/dev/sdb1": {
++					mountpoint: "/var/lib/docker",
++					fsType:     "ext4",
++				},
++				"/dev/sdb2": {
++					mountpoint: "/var/lib/docker/btrfs",
++					fsType:     "btrfs",
++				},
++			},
++			expectedDockerDevice: "/dev/sdb2",
++		},
++	}
++
++	for _, tt := range tests {
++		dmsetup := &testDmsetup{
++			data: []byte(tt.dmsetupTable),
++		}
++		partitions := tt.partitions
++		labels := map[string]string{}
++
++		context := Context{
++			DockerRoot: "/var/lib/docker",
++			DockerInfo: map[string]string{
++				"Driver":       tt.driver,
++				"DriverStatus": tt.driverStatus,
++			},
++		}
++
++		addDockerImagesLabel(context, dmsetup, labels, partitions)
++
++		if e, a := tt.expectedDockerDevice, labels[LabelDockerImages]; e != a {
++			t.Errorf("%s: docker device: expected %q, got %q", tt.name, e, a)
++		}
++
++		if tt.expectedPartition == nil {
++			continue
++		}
++		if e, a := *tt.expectedPartition, partitions[tt.expectedDockerDevice]; !reflect.DeepEqual(e, a) {
++			t.Errorf("%s: docker partition: expected %#v, got %#v", tt.name, e, a)
++		}
++	}
++}
++
++func TestGetDockerDeviceMapperInfo(t *testing.T) {
++	tests := []struct {
++		name              string
++		driver            string
++		driverStatus      string
++		dmsetupTable      string
++		dmsetupTableError error
++		expectedDevice    string
++		expectedPartition *partition
++		expectedError     bool
++	}{
++		{
++			name:              "not devicemapper",
++			driver:            "btrfs",
++			expectedDevice:    "",
++			expectedPartition: nil,
++			expectedError:     false,
++		},
++		{
++			name:              "error unmarshaling driver status",
++			driver:            "devicemapper",
++			driverStatus:      "{[[[asdf",
++			expectedDevice:    "",
++			expectedPartition: nil,
++			expectedError:     true,
++		},
++		{
++			name:              "loopback",
++			driver:            "devicemapper",
++			driverStatus:      `[["Data loop file","/var/lib/docker/devicemapper/devicemapper/data"]]`,
++			expectedDevice:    "",
++			expectedPartition: nil,
++			expectedError:     false,
++		},
++		{
++			name:              "missing pool name",
++			driver:            "devicemapper",
++			driverStatus:      `[[]]`,
++			expectedDevice:    "",
++			expectedPartition: nil,
++			expectedError:     true,
++		},
++		{
++			name:              "error invoking dmsetup",
++			driver:            "devicemapper",
++			driverStatus:      `[["Pool Name", "vg_vagrant-docker--pool"]]`,
++			dmsetupTableError: errors.New("foo"),
++			expectedDevice:    "",
++			expectedPartition: nil,
++			expectedError:     true,
++		},
++		{
++			name:              "unable to parse dmsetup table",
++			driver:            "devicemapper",
++			driverStatus:      `[["Pool Name", "vg_vagrant-docker--pool"]]`,
++			dmsetupTable:      "no data here!",
++			expectedDevice:    "",
++			expectedPartition: nil,
++			expectedError:     true,
++		},
++		{
++			name:           "happy path",
++			driver:         "devicemapper",
++			driverStatus:   `[["Pool Name", "vg_vagrant-docker--pool"]]`,
++			dmsetupTable:   "0 53870592 thin-pool 253:2 253:3 1024 0 1 skip_block_zeroing",
++			expectedDevice: "vg_vagrant-docker--pool",
++			expectedPartition: &partition{
++				fsType:    "devicemapper",
++				major:     253,
++				minor:     3,
++				blockSize: 1024,
++			},
++			expectedError: false,
++		},
++	}
++
++	for _, tt := range tests {
++		dmsetup := &testDmsetup{
++			data: []byte(tt.dmsetupTable),
++		}
++
++		dockerInfo := map[string]string{
++			"Driver":       tt.driver,
++			"DriverStatus": tt.driverStatus,
++		}
++
++		device, partition, err := getDockerDeviceMapperInfo(dockerInfo, dmsetup)
++
++		if tt.expectedError && err == nil {
++			t.Errorf("%s: expected error but got nil", tt.name)
++			continue
++		}
++		if !tt.expectedError && err != nil {
++			t.Errorf("%s: unexpected error: %v", tt.name, err)
++			continue
++		}
++
++		if e, a := tt.expectedDevice, device; e != a {
++			t.Errorf("%s: device: expected %q, got %q", tt.name, e, a)
++		}
++
++		if e, a := tt.expectedPartition, partition; !reflect.DeepEqual(e, a) {
++			t.Errorf("%s: partition: expected %#v, got %#v", tt.name, e, a)
++		}
++	}
++}
+diff --git a/fs/types.go b/fs/types.go
+index 317af49..17bc5f1 100644
+--- a/fs/types.go
++++ b/fs/types.go
+@@ -16,6 +16,14 @@ package fs
+ 
+ import "time"
+ 
++type partition struct {
++	mountpoint string
++	major      uint
++	minor      uint
++	fsType     string
++	blockSize  uint
++}
++
+ type DeviceInfo struct {
+ 	Device string
+ 	Major  uint
+@@ -60,6 +68,9 @@ type DiskStats struct {
+ }
+ 
+ type FsInfo interface {
++	// Refreshes the cache
++	RefreshCache()
++
+ 	// Returns capacity and free space, in bytes, of all the ext2, ext3, ext4 filesystems on the host.
+ 	GetGlobalFsInfo() ([]Fs, error)
+ 
+@@ -81,3 +92,13 @@ type FsInfo interface {
+ 	// Returns the mountpoint associated with a particular device.
+ 	GetMountpointForDevice(device string) (string, error)
+ }
++
++type PartitionCache interface {
++	Refresh() error
++	Clear()
++	PartitionForDevice(device string) (partition, error)
++	DeviceInfoForMajorMinor(major uint, minor uint) (*DeviceInfo, error)
++	ApplyOverPartitions(f func(device string, p partition) error) error
++	DeviceNameForLabel(label string) (string, error)
++	ApplyOverLabels(f func(label string, device string) error) error
++}
+-- 
+2.7.4
+

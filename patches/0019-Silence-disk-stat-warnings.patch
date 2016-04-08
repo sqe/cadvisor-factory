@@ -1,0 +1,35 @@
+From f69b933965d45e27362a9934a9d87ce49bcbbb2b Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Tue, 12 Apr 2016 14:42:09 +0200
+Subject: [PATCH] Silence disk stat warnings
+
+Adding this warning was useful to find the need to de-reference mount
+sources, but now it's mainly creating noise considering our ecryptfs
+volumes don't show up in diskstats.
+
+In practice, we're not really using those stats for much, so it's fine
+if they are missing.
+---
+ fs/fs.go | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/fs/fs.go b/fs/fs.go
+index a7dd4c8..d9dbefe 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -135,7 +135,11 @@ func (self *RealFsInfo) getFilteredFsInfo(filter func(device string, partition p
+ 		for _, fs := range filesystemsOut {
+ 			diskStats, ok := diskStatsMap[fs.DeviceInfo.Device]
+ 			if !ok {
+-				glog.Errorf("Disk stats for %q not found", fs.DeviceInfo.Device)
++				// TODO: ecryptfs breaks with this, since the disk stats we should
++				// report are the disk stats for the underlying physical volume, not
++				// the ecryptfs one. We should (probably) handle ecryptfs a little
++				// differently here, and look at the disk stats for the lower layer.
++				// glog.Warningf("Disk stats for %q not found", fs.DeviceInfo.Device)
+ 				continue
+ 			}
+ 			fs.DiskStats = diskStats
+-- 
+2.7.4
+

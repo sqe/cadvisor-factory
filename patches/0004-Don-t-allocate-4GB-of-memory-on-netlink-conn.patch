@@ -1,7 +1,7 @@
 From 3d064720a27e6ec14f5b282eacfd3a62867e02c8 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Thu, 31 Mar 2016 23:36:08 +0200
-Subject: [PATCH 4/7] Don't allocate 4GB of memory on netlink conn
+Subject: [PATCH] Don't allocate 4GB of memory on netlink conn
 
 ---
  utils/cpuload/netlink/conn.go    |  8 ++++++++
@@ -123,5 +123,5 @@ index 7ca05f3..accf294 100644
  			if err != nil {
  				return 0, err
 -- 
-1.9.1
+2.7.4
 

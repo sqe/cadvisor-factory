@@ -1,0 +1,85 @@
+From 849b6fc4cc2cb96f40798e27a50b5a405c87dbd1 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Tue, 12 Apr 2016 14:29:24 +0200
+Subject: [PATCH] Deference symlinks when loading partition list
+
+---
+ fs/fs.go              |  8 +++-----
+ fs/mount_helper.go    | 18 +++++++++++++++++-
+ fs/partition_cache.go |  2 +-
+ 3 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/fs/fs.go b/fs/fs.go
+index 3e05a99..a7dd4c8 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -49,14 +49,12 @@ func NewFsInfo(context Context) (FsInfo, error) {
+ 		partitionCache: NewPartitionCache(context),
+ 	}
+ 
+-	partitions := make([]partition, 0)
+-	fsInfo.partitionCache.ApplyOverPartitions(func(_ string, p partition) error {
+-		partitions = append(partitions, p)
++	glog.Infof("Listing filesystem partitions:")
++	fsInfo.partitionCache.ApplyOverPartitions(func(d string, p partition) error {
++		glog.Infof("%s: %+v", d, p)
+ 		return nil
+ 	})
+ 
+-	glog.Infof("Filesystem partitions: %+v", partitions)
+-
+ 	return fsInfo, nil
+ }
+ 
+diff --git a/fs/mount_helper.go b/fs/mount_helper.go
+index b1ca52f..737d019 100644
+--- a/fs/mount_helper.go
++++ b/fs/mount_helper.go
+@@ -17,6 +17,7 @@ package fs
+ 
+ import (
+ 	dockerMountInfo "github.com/docker/docker/pkg/mount"
++	"path/filepath"
+ )
+ 
+ type mountInfoClient interface {
+@@ -26,7 +27,22 @@ type mountInfoClient interface {
+ type defaultMountInfoClient struct{}
+ 
+ func (*defaultMountInfoClient) GetMounts() ([]*dockerMountInfo.Info, error) {
+-	return dockerMountInfo.GetMounts()
++	mounts, err := dockerMountInfo.GetMounts()
++	if err != nil {
++		return nil, err
++	}
++
++	for _, mount := range mounts {
++		// Dereference the device name to account for symlinks (e.g. /dev/disk/by-uuid/...)
++		// Not all mounts can be de-referenced though, so we skip silently mounts that cannot.
++		deviceName, err := filepath.EvalSymlinks(mount.Source)
++		if err != nil {
++			continue
++		}
++		mount.Source = deviceName
++	}
++
++	return mounts, nil
+ }
+ 
+ var _ mountInfoClient = &defaultMountInfoClient{}
+diff --git a/fs/partition_cache.go b/fs/partition_cache.go
+index d1b3a83..c3b14e2 100644
+--- a/fs/partition_cache.go
++++ b/fs/partition_cache.go
+@@ -95,7 +95,7 @@ func (self *RealPartitionCache) Refresh() error {
+ 			continue
+ 		}
+ 		if mount.Fstype == "zfs" {
+-			Fstype = mount.Fstype // REVIEW: Is this correct?
++			Fstype = mount.Fstype // REVIEW: Is this correct? We don't set Fstype for non-ZFS.
+ 		}
+ 		partitions[mount.Source] = partition{
+ 			fsType:     Fstype,
+-- 
+2.7.4
+

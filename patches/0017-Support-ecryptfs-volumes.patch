@@ -1,0 +1,30 @@
+From 439423b32a53201eeb573c6b92d3eff0a316ac0b Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Mon, 11 Apr 2016 18:33:13 +0200
+Subject: [PATCH] Support ecryptfs volumes
+
+---
+ fs/partition_cache.go | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/partition_cache.go b/fs/partition_cache.go
+index 45248e1..d1b3a83 100644
+--- a/fs/partition_cache.go
++++ b/fs/partition_cache.go
+@@ -75,9 +75,10 @@ func (self *RealPartitionCache) Refresh() error {
+ 
+ 	supportedFsType := map[string]bool{
+ 		// all ext systems are checked through prefix.
+-		"btrfs": true,
+-		"xfs":   true,
+-		"zfs":   true,
++		"btrfs":    true,
++		"xfs":      true,
++		"zfs":      true,
++		"ecryptfs": true,
+ 	}
+ 
+ 	mounts, err := self.mountInfo.GetMounts()
+-- 
+2.7.4
+

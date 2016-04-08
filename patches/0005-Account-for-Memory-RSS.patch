@@ -1,7 +1,7 @@
 From 470af9c7088587eee26272c0117169a073c12e98 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Fri, 1 Apr 2016 10:38:12 +0200
-Subject: [PATCH 5/7] Account for Memory RSS
+Subject: [PATCH] Account for Memory RSS
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -102,5 +102,5 @@ index aa8aafe..6c4e8e3 100644
  	series[colMemoryWorkingSet] = stats.Memory.WorkingSet
  
 -- 
-1.9.1
+2.7.4
 

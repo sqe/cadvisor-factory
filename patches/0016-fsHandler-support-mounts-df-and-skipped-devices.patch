@@ -1,0 +1,1064 @@
+From adf36419085a4e3030ccb28e38f0900900369e6e Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 8 Apr 2016 16:28:57 +0200
+Subject: [PATCH] fsHandler: support mounts, df, and skipped devices
+
+This makes 3 changes to fsHandler:
+
+- First, it adds support for container mounts (i.e. we can report on an
+  arbitrary number of directories, not just 2).
+- Second, it adds a flag that allows the user to choose between `du` for
+  accurate (but somewhat expensive) disk usgae reporting and `df` for
+  faster-but-coarser FS-level reporting (of course, FS-level metrics
+  don't account for multiple containers using the same volume).
+- Third, it adds a flag that allows the user to submit a regex of
+  devices to be ignored when reporting usage stats.
+---
+ container/docker/fsHandler.go      | 240 +++++++++++++++++++++-----
+ container/docker/fsHandler_test.go | 333 +++++++++++++++++++++++++++++++++++++
+ container/docker/handler.go        | 106 ++++++------
+ container/raw/handler.go           |   4 +-
+ fs/fs.go                           | 114 ++++++++-----
+ fs/types.go                        |   7 +-
+ manager/machine.go                 |   2 +-
+ 7 files changed, 671 insertions(+), 135 deletions(-)
+ create mode 100644 container/docker/fsHandler_test.go
+
+diff --git a/container/docker/fsHandler.go b/container/docker/fsHandler.go
+index c5b406a..3a5b5e2 100644
+--- a/container/docker/fsHandler.go
++++ b/container/docker/fsHandler.go
+@@ -16,6 +16,10 @@
+ package docker
+ 
+ import (
++	"flag"
++	"fmt"
++	info "github.com/google/cadvisor/info/v1"
++	"regexp"
+ 	"sync"
+ 	"time"
+ 
+@@ -24,22 +28,60 @@ import (
+ 	"github.com/golang/glog"
+ )
+ 
++type skippedDevices struct {
++	r *regexp.Regexp
++}
++
++var (
++	defaultSkippedDevicesRegexp = regexp.MustCompile("$^") // Regexp that matches nothing
++	skipDevicesFlag             = skippedDevices{
++		r: defaultSkippedDevicesRegexp,
++	}
++)
++
++func (self *skippedDevices) String() string {
++	return self.r.String()
++}
++
++func (self *skippedDevices) Set(value string) error {
++	r, err := regexp.Compile(value)
++
++	if err != nil {
++		return err
++	}
++
++	self.r = r
++	return nil
++}
++
++func (self *skippedDevices) Has(device string) bool {
++	return self.r.MatchString(device)
++}
++
++var skipDuFlag = flag.Bool("disk_skip_du", false, "do not use du for disk metrics (use raw FS stats instead)")
++
++func init() {
++	flag.Var(&skipDevicesFlag, "disk_skip_devices", "Regex representing devices to ignore when reporting disk metrics")
++}
++
+ type fsHandler interface {
+ 	start()
+-	usage() (uint64, uint64)
+ 	stop()
++	usage() ([]*info.FsStats, error)
++	update() error // Exposed privately for tests
+ }
+ 
+ type realFsHandler struct {
+ 	sync.RWMutex
+-	lastUpdate     time.Time
+-	usageBytes     uint64
+-	baseUsageBytes uint64
+-	period         time.Duration
+-	minPeriod      time.Duration
+-	rootfs         string
+-	extraDir       string
+-	fsInfo         fs.FsInfo
++	lastUpdate  time.Time
++	fsStats     []*info.FsStats
++	period      time.Duration
++	minPeriod   time.Duration
++	skipDu      bool
++	skipDevices skippedDevices
++	fsInfo      fs.FsInfo
++	baseDirs    map[string]struct{}
++	allDirs     map[string]struct{}
+ 	// Tells the container to stop.
+ 	stopChan chan struct{}
+ }
+@@ -50,55 +92,175 @@ const (
+ 	maxDuBackoffFactor = 20
+ )
+ 
++// Enforce that realFsHandler conforms to fsHandler interface
+ var _ fsHandler = &realFsHandler{}
+ 
+-func newFsHandler(period time.Duration, rootfs, extraDir string, fsInfo fs.FsInfo) fsHandler {
++func newFsHandler(period time.Duration, baseDirs []string, extraDirs []string, fsInfo fs.FsInfo) fsHandler {
++	allDirsSet := make(map[string]struct{})
++	baseDirsSet := make(map[string]struct{})
++
++	for _, dir := range baseDirs {
++		allDirsSet[dir] = struct{}{}
++		baseDirsSet[dir] = struct{}{}
++	}
++
++	for _, dir := range extraDirs {
++		allDirsSet[dir] = struct{}{}
++	}
++
+ 	return &realFsHandler{
+-		lastUpdate:     time.Time{},
+-		usageBytes:     0,
+-		baseUsageBytes: 0,
+-		period:         period,
+-		minPeriod:      period,
+-		rootfs:         rootfs,
+-		extraDir:       extraDir,
+-		fsInfo:         fsInfo,
+-		stopChan:       make(chan struct{}, 1),
++		lastUpdate:  time.Time{},
++		fsStats:     nil,
++		period:      period,
++		minPeriod:   period,
++		skipDu:      *skipDuFlag,
++		skipDevices: skipDevicesFlag,
++		baseDirs:    baseDirsSet,
++		allDirs:     allDirsSet,
++		fsInfo:      fsInfo,
++		stopChan:    make(chan struct{}, 1),
+ 	}
+ }
+ 
+-func (fh *realFsHandler) update() error {
+-	var (
+-		baseUsage, extraDirUsage uint64
+-		err                      error
+-	)
+-	// TODO(vishh): Add support for external mounts.
+-	if fh.rootfs != "" {
+-		baseUsage, err = fh.fsInfo.GetDirUsage(fh.rootfs, duTimeout)
++func addOrDefault(m map[string]uint64, key string, add uint64) {
++	value, ok := m[key]
++	if ok {
++		m[key] = value + add
++	} else {
++		m[key] = add
++	}
++}
++
++func (fh *realFsHandler) gatherDiskUsage(devices map[string]struct{}) (map[string]uint64, map[string]uint64, error) {
++	deviceToBaseUsageBytes := make(map[string]uint64)
++	deviceToTotalUsageBytes := make(map[string]uint64)
++
++	if fh.skipDu {
++		return deviceToBaseUsageBytes, deviceToTotalUsageBytes, nil
++	}
++
++	// Go through all directories and get their usage
++	for dir := range fh.allDirs {
++		if dir == "" {
++			// This should not happen if we're called properly, but it's
++			// presumably not worth crashing for.
++			glog.Warningf("FS handler received an empty dir: %q", dir)
++			continue
++		}
++
++		deviceInfo, err := fh.fsInfo.GetDirFsDevice(dir)
+ 		if err != nil {
+-			return err
++			return nil, nil, err
+ 		}
++
++		// Check whether this device was ignored prior to running du on it.
++		_, collectUsageForDevice := devices[deviceInfo.Device]
++		if !collectUsageForDevice {
++			continue
++		}
++
++		usage, err := fh.fsInfo.GetDirUsage(dir, duTimeout)
++		if err != nil {
++			return nil, nil, err
++		}
++
++		// Only count usage against baseUsage if this directory is a base directory
++		var baseUsage uint64 = 0
++		_, isBaseDir := fh.baseDirs[dir]
++		if isBaseDir {
++			baseUsage = usage
++		}
++
++		addOrDefault(deviceToTotalUsageBytes, deviceInfo.Device, usage)
++		addOrDefault(deviceToBaseUsageBytes, deviceInfo.Device, baseUsage)
+ 	}
+ 
+-	if fh.extraDir != "" {
+-		extraDirUsage, err = fh.fsInfo.GetDirUsage(fh.extraDir, duTimeout)
++	return deviceToBaseUsageBytes, deviceToTotalUsageBytes, nil
++}
++
++func (fh *realFsHandler) update() error {
++	// Start with figuring out which devices we care about
++	deviceSet := make(map[string]struct{})
++	for dir := range fh.allDirs {
++		fsDevice, err := fh.fsInfo.GetDirFsDevice(dir)
+ 		if err != nil {
+-			return err
++			glog.Warningf("Unable to find device for directory %q: %v", dir, err)
++			continue
++		}
++
++		if fh.skipDevices.Has(fsDevice.Device) {
++			continue
++		}
++
++		deviceSet[fsDevice.Device] = struct{}{}
++	}
++
++	// If we are relying on du for metrics, then gather the usage for each of those devices
++	deviceToBaseUsageBytes, deviceToTotalUsageBytes, err := fh.gatherDiskUsage(deviceSet)
++	if err != nil {
++		return err
++	}
++
++	// Then, grab the usage limit for each of those devices, as well as usage if we
++	// are relying on df for metrics.
++	fsStats := make([]*info.FsStats, 0)
++
++	// Request Fs info for all the device in use, but skip io stats (we won't report them,
++	// since per-container data is available via cgroups)
++	filesystems, err := fh.fsInfo.GetFsInfoForDevices(deviceSet, false)
++	if err != nil {
++		return err
++	}
++
++	for _, fs := range filesystems {
++		stat := info.FsStats{
++			Device: fs.Device,
++			Type:   string(fs.Type),
++			Limit:  fs.Capacity,
++		}
++
++		// If we're using du, then use the metrics we collected above.
++		// If we're using df, then simply use the value provided by GetGlobalFsInfo.
++		if fh.skipDu {
++			stat.Usage = fs.Capacity - fs.Available
++		} else {
++			baseUsage, ok := deviceToBaseUsageBytes[fs.Device]
++			if !ok {
++				return fmt.Errorf("Base usage for device %q expected but not collected!", fs.Device)
++			}
++
++			totalUsage, ok := deviceToTotalUsageBytes[fs.Device]
++			if !ok {
++				return fmt.Errorf("Total usage for device %q expected but not collected!", fs.Device)
++			}
++			stat.BaseUsage = baseUsage
++			stat.Usage = totalUsage
+ 		}
++
++		fsStats = append(fsStats, &stat)
++	}
++
++	if err != nil {
++		return err
+ 	}
+ 
+ 	fh.Lock()
+ 	defer fh.Unlock()
+ 	fh.lastUpdate = time.Now()
+-	fh.usageBytes = baseUsage + extraDirUsage
+-	fh.baseUsageBytes = baseUsage
++	fh.fsStats = fsStats
+ 	return nil
+ }
+ 
+ func (fh *realFsHandler) trackUsage() {
+-	fh.update()
++	err := fh.update()
++	if err != nil {
++		glog.Errorf("failed to collect filesystem stats - %v", err)
++	}
++
+ 	for {
+ 		select {
+ 		case <-fh.stopChan:
++			// TODO: Does this work without sending anything in?
+ 			return
+ 		case <-time.After(fh.period):
+ 			start := time.Now()
+@@ -113,7 +275,7 @@ func (fh *realFsHandler) trackUsage() {
+ 			}
+ 			duration := time.Since(start)
+ 			if duration > longDu {
+-				glog.V(2).Infof("`du` on following dirs took %v: %v", duration, []string{fh.rootfs, fh.extraDir})
++				glog.V(2).Infof("`du` on following dirs took %v: %v", duration, fh.allDirs)
+ 			}
+ 		}
+ 	}
+@@ -127,8 +289,12 @@ func (fh *realFsHandler) stop() {
+ 	close(fh.stopChan)
+ }
+ 
+-func (fh *realFsHandler) usage() (baseUsageBytes, totalUsageBytes uint64) {
++func (fh *realFsHandler) usage() ([]*info.FsStats, error) {
+ 	fh.RLock()
+ 	defer fh.RUnlock()
+-	return fh.baseUsageBytes, fh.usageBytes
++	if (fh.lastUpdate == time.Time{}) {
++		// Do not report metrics if we don't have any!
++		return []*info.FsStats{}, fmt.Errorf("No disk usage metrics available yet")
++	}
++	return fh.fsStats, nil
+ }
+diff --git a/container/docker/fsHandler_test.go b/container/docker/fsHandler_test.go
+new file mode 100644
+index 0000000..46307ee
+--- /dev/null
++++ b/container/docker/fsHandler_test.go
+@@ -0,0 +1,333 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package docker
++
++import (
++	"fmt"
++	"github.com/google/cadvisor/fs"
++	"github.com/stretchr/testify/assert"
++	"testing"
++	"time"
++)
++
++type testFsInfo struct {
++	allowDirUsage bool
++	t             *testing.T
++}
++
++func (self *testFsInfo) RefreshCache() {}
++
++var (
++	sda1 = fs.Fs{
++		DeviceInfo: fs.DeviceInfo{
++			Device: "/dev/sda1",
++		},
++		Type:      "ext4",
++		Capacity:  5000,
++		Available: 2000,
++	}
++	sda2 = fs.Fs{
++		DeviceInfo: fs.DeviceInfo{
++			Device: "/dev/sda2",
++		},
++		Type:      "ext4",
++		Capacity:  1000,
++		Available: 500,
++	}
++	sdb1 = fs.Fs{
++		DeviceInfo: fs.DeviceInfo{
++			Device: "/dev/sdb1",
++		},
++		Type:      "xfs",
++		Capacity:  3000,
++		Available: 500,
++	}
++	sdc1 = fs.Fs{
++		DeviceInfo: fs.DeviceInfo{
++			Device: "/dev/sdc1",
++		},
++		Type:      "zfs",
++		Capacity:  4000,
++		Available: 4000,
++	}
++)
++
++func (self *testFsInfo) GetGlobalFsInfo(_ bool) ([]fs.Fs, error) {
++	return []fs.Fs{sda1, sda2, sdb1, sdc1}, nil
++}
++
++func (self *testFsInfo) GetFsInfoForMounts(mountSet map[string]struct{}, _ bool) ([]fs.Fs, error) {
++	return nil, fmt.Errorf("Not implemented: GetFsInfoForMounts(%+v)", mountSet)
++}
++
++func (self *testFsInfo) GetFsInfoForDevices(deviceSet map[string]struct{}, _ bool) ([]fs.Fs, error) {
++	fsMap := map[string]fs.Fs{
++		"/dev/sda1": sda1,
++		"/dev/sda2": sda2,
++		"/dev/sdb1": sdb1,
++		// /dev/sdc1 isn't there because we should never be looking at it
++	}
++	fsOut := make([]fs.Fs, 0)
++
++	for device := range deviceSet {
++		fs, ok := fsMap[device]
++		if !ok {
++			return nil, fmt.Errorf("GetFsInfoForDevices was called with unexpected device: %q", device)
++		}
++		fsOut = append(fsOut, fs)
++	}
++
++	return fsOut, nil
++}
++
++func (self *testFsInfo) GetDirUsage(dir string, timeout time.Duration) (uint64, error) {
++	if !self.allowDirUsage {
++		return uint64(0), fmt.Errorf("Dir usage is disabled for this test!")
++	}
++	if dir == "/var/lib/docker/aufs/diff/aa" {
++		return uint64(100), nil
++	}
++	if dir == "/var/lib/docker/containers/aa" {
++		return uint64(50), nil
++	}
++	if dir == "/some/mount" {
++		return uint64(2000), nil
++	}
++	if dir == "/other/mount" {
++		return uint64(200), nil
++	}
++	// /sdcmount isn't there because we should never be looking at it
++	return uint64(0), fmt.Errorf("Not implemented: GetDirUsage(%s, ...)", dir)
++}
++
++func (self *testFsInfo) GetDirFsDevice(dir string) (*fs.DeviceInfo, error) {
++	if dir == "/var/lib/docker/aufs/diff/aa" {
++		return &fs.DeviceInfo{Device: "/dev/sda1"}, nil
++	}
++	if dir == "/var/lib/docker/containers/aa" {
++		return &fs.DeviceInfo{Device: "/dev/sda2"}, nil
++	}
++	if dir == "/some/mount" {
++		return &fs.DeviceInfo{Device: "/dev/sdb1"}, nil
++	}
++	if dir == "/other/mount" {
++		return &fs.DeviceInfo{Device: "/dev/sdb1"}, nil
++	}
++	if dir == "/sdcmount" {
++		return &fs.DeviceInfo{Device: "/dev/sdc1"}, nil
++	}
++	return nil, fmt.Errorf("Not implemented: GetDirFsDevice(%s)", dir)
++}
++
++func (self *testFsInfo) GetDeviceForLabel(label string) (string, error) {
++	return "", fmt.Errorf("Not implemented: GetDeviceForLabel(%s)", label)
++}
++
++func (self *testFsInfo) GetLabelsForDevice(device string) ([]string, error) {
++	return nil, fmt.Errorf("Not implemented: GetLabelsForDevice(%s)", device)
++}
++
++func (self *testFsInfo) GetMountpointForDevice(device string) (string, error) {
++	return "", fmt.Errorf("Not implemented: GetMountpointForDevice(%s)", device)
++}
++
++var testBaseDirs = []string{
++	"/var/lib/docker/aufs/diff/aa",
++	"/some/mount",
++	"/other/mount",
++}
++
++var testExtraDirs = []string{
++	"/var/lib/docker/containers/aa",
++}
++
++func TestCollectionWithDu(t *testing.T) {
++	as := assert.New(t)
++
++	(*skipDuFlag) = false
++	hdlr := newFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
++		allowDirUsage: true,
++		t:             t,
++	})
++
++	// Usage before trackUsage should return an error
++	usage, err := hdlr.usage()
++	as.Error(err)
++	as.Equal(0, len(usage))
++
++	err = hdlr.update()
++	as.NoError(err)
++
++	usage, err = hdlr.usage()
++	as.NoError(err)
++
++	foundSda1 := false
++	foundSda2 := false
++	foundSdb1 := false
++
++	for _, stat := range usage {
++		if stat.Device == "/dev/sda1" {
++			// Only the aufs layer
++			as.Equal("ext4", stat.Type)
++			as.Equal(uint64(5000), stat.Limit)
++			as.Equal(uint64(100), stat.BaseUsage)
++			as.Equal(uint64(100), stat.Usage)
++			foundSda1 = true
++			continue
++		}
++
++		if stat.Device == "/dev/sda2" {
++			// Only logs
++			as.Equal("ext4", stat.Type)
++			as.Equal(uint64(1000), stat.Limit)
++			as.Equal(uint64(0), stat.BaseUsage)
++			as.Equal(uint64(50), stat.Usage)
++			foundSda2 = true
++			continue
++		}
++
++		if stat.Device == "/dev/sdb1" {
++			// Two mounts
++			as.Equal("xfs", stat.Type)
++			as.Equal(uint64(3000), stat.Limit)
++			as.Equal(uint64(2200), stat.BaseUsage)
++			as.Equal(uint64(2200), stat.Usage)
++			foundSdb1 = true
++			continue
++		}
++
++		t.Errorf("Unexpected device in results: %q", stat.Device)
++	}
++
++	as.True(foundSda1)
++	as.True(foundSda2)
++	as.True(foundSdb1)
++}
++
++func TestCollectionWithDf(t *testing.T) {
++	as := assert.New(t)
++
++	(*skipDuFlag) = true
++	hdlr := newFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
++		allowDirUsage: false,
++		t:             t,
++	})
++
++	err := hdlr.update()
++	as.NoError(err)
++
++	usage, err := hdlr.usage()
++	as.NoError(err)
++
++	foundSda1 := false
++	foundSda2 := false
++	foundSdb1 := false
++
++	for _, stat := range usage {
++		if stat.Device == "/dev/sda1" {
++			// Only the aufs layer
++			as.Equal(uint64(5000), stat.Limit)
++			as.Equal(uint64(3000), stat.Usage)
++			foundSda1 = true
++			continue
++		}
++
++		if stat.Device == "/dev/sda2" {
++			// Only logs
++			as.Equal(uint64(1000), stat.Limit)
++			as.Equal(uint64(500), stat.Usage)
++			foundSda2 = true
++			continue
++		}
++
++		if stat.Device == "/dev/sdb1" {
++			// Two mounts
++			as.Equal(uint64(3000), stat.Limit)
++			as.Equal(uint64(2500), stat.Usage)
++			foundSdb1 = true
++			continue
++		}
++
++		t.Errorf("Unexpected device in results: %q", stat.Device)
++	}
++
++	as.True(foundSda1)
++	as.True(foundSda2)
++	as.True(foundSdb1)
++}
++
++func TestCollectionWithDfAndIgnoredDevices(t *testing.T) {
++	as := assert.New(t)
++
++	(*skipDuFlag) = true
++	skipDevicesFlag.Set("/dev/sda\\d")
++	hdlr := newFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
++		allowDirUsage: false,
++		t:             t,
++	})
++
++	err := hdlr.update()
++	as.NoError(err)
++
++	usage, err := hdlr.usage()
++	as.NoError(err)
++
++	foundSdb1 := false
++
++	for _, stat := range usage {
++		if stat.Device == "/dev/sda1" {
++			t.Errorf("Metrics for /dev/sda1 reported despite being ignored!")
++			continue
++		}
++
++		if stat.Device == "/dev/sda2" {
++			t.Errorf("Metrics for /dev/sda2 reported despite being ignored!")
++			continue
++		}
++
++		if stat.Device == "/dev/sdb1" {
++			foundSdb1 = true
++			continue
++		}
++
++		t.Errorf("Unexpected device in results: %q", stat.Device)
++	}
++
++	as.True(foundSdb1)
++}
++
++func TestCollectionWithDuAndIgnoredDevices(t *testing.T) {
++	as := assert.New(t)
++
++	(*skipDuFlag) = false
++	skipDevicesFlag.Set("/dev/sdc1")
++	hdlr := newFsHandler(time.Second, []string{"/sdcmount"}, []string{}, &testFsInfo{
++		allowDirUsage: true,
++		t:             t,
++	})
++
++	err := hdlr.update()
++	as.NoError(err)
++
++	usage, err := hdlr.usage()
++	as.NoError(err)
++
++	for _, stat := range usage {
++		if stat.Device == "/dev/sdc1" {
++			t.Errorf("Metrics for /dev/sdc1 reported despite being ignored!")
++			continue
++		}
++	}
++}
+diff --git a/container/docker/handler.go b/container/docker/handler.go
+index bfdbeb2..38285bf 100644
+--- a/container/docker/handler.go
++++ b/container/docker/handler.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/google/cadvisor/utils"
+ 
+ 	docker "github.com/fsouza/go-dockerclient"
++	"github.com/golang/glog"
+ 	"github.com/opencontainers/runc/libcontainer/cgroups"
+ 	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
+ 	libcontainerconfigs "github.com/opencontainers/runc/libcontainer/configs"
+@@ -39,7 +40,7 @@ const (
+ 	// The read write layers exist here.
+ 	aufsRWLayer = "diff"
+ 	// Path to the directory where docker stores log files if the json logging driver is enabled.
+-	pathToContainersDir = "containers"
++	pathToContainersLogDir = "containers"
+ )
+ 
+ type dockerContainerHandler struct {
+@@ -56,9 +57,8 @@ type dockerContainerHandler struct {
+ 	// Manager of this container's cgroups.
+ 	cgroupManager cgroups.Manager
+ 
+-	storageDriver    storageDriver
+-	fsInfo           fs.FsInfo
+-	rootfsStorageDir string
++	storageDriver storageDriver
++	fsInfo        fs.FsInfo
+ 
+ 	// Time at which this container was created.
+ 	creationTime time.Time
+@@ -67,6 +67,10 @@ type dockerContainerHandler struct {
+ 	labels map[string]string
+ 	envs   map[string]string
+ 
++	// The directories in use by this container
++	baseDirs  []string
++	extraDirs []string
++
+ 	// The container PID used to switch namespaces as required
+ 	pid int
+ 
+@@ -137,21 +141,10 @@ func newDockerContainerHandler(
+ 
+ 	id := ContainerNameToDockerId(name)
+ 
+-	// Add the Containers dir where the log files are stored.
+-	// FIXME: Give `otherStorageDir` a more descriptive name.
+-	otherStorageDir := path.Join(storageDir, pathToContainersDir, id)
+-
+ 	rwLayerID, err := getRwLayerID(id, storageDir, storageDriver, dockerVersion)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var rootfsStorageDir string
+-	switch storageDriver {
+-	case aufsStorageDriver:
+-		rootfsStorageDir = path.Join(storageDir, string(aufsStorageDriver), aufsRWLayer, rwLayerID)
+-	case overlayStorageDriver:
+-		rootfsStorageDir = path.Join(storageDir, string(overlayStorageDriver), rwLayerID)
+-	}
+ 
+ 	handler := &dockerContainerHandler{
+ 		id:                 id,
+@@ -163,15 +156,10 @@ func newDockerContainerHandler(
+ 		storageDriver:      storageDriver,
+ 		fsInfo:             fsInfo,
+ 		rootFs:             rootFs,
+-		rootfsStorageDir:   rootfsStorageDir,
+ 		envs:               make(map[string]string),
+ 		ignoreMetrics:      ignoreMetrics,
+ 	}
+ 
+-	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
+-		handler.fsHandler = newFsHandler(time.Minute, rootfsStorageDir, otherStorageDir, fsInfo)
+-	}
+-
+ 	// We assume that if Inspect fails then the container is not known to docker.
+ 	ctnr, err := client.InspectContainer(id)
+ 	if err != nil {
+@@ -196,6 +184,47 @@ func newDockerContainerHandler(
+ 		}
+ 	}
+ 
++	handler.baseDirs = make([]string, 0)
++	handler.extraDirs = make([]string, 0)
++
++	// Docker API >= 1.20 exposes a "Mounts" list of structures representing mounts
++	// (https://docs.docker.com/engine/reference/api/docker_remote_api_v1.20/)
++	for _, mount := range ctnr.Mounts {
++		handler.baseDirs = append(handler.baseDirs, path.Join(rootFs, mount.Source))
++	}
++
++	// Docker API < 1.20 exposes a "Volumes" mapping of container paths to host paths.
++	// (https://docs.docker.com/engine/reference/api/docker_remote_api_v1.19/)
++	for _, hostPath := range ctnr.Volumes {
++		handler.baseDirs = append(handler.baseDirs, path.Join(rootFs, hostPath))
++	}
++
++	// Now, handle the rootfs
++	rootfsStorageDir := ""
++	switch storageDriver {
++	case aufsStorageDriver:
++		rootfsStorageDir = path.Join(storageDir, string(aufsStorageDriver), aufsRWLayer, rwLayerID)
++	case overlayStorageDriver:
++		rootfsStorageDir = path.Join(storageDir, string(overlayStorageDriver), rwLayerID)
++	}
++
++	// We support (and found) the mount
++	if rootfsStorageDir != "" {
++		handler.baseDirs = append(handler.baseDirs, rootfsStorageDir)
++	} else {
++		glog.Warningf("Unable to find root mount for container %q (storageDriver: %q)", name, storageDriver)
++	}
++
++	// Now, handle the storage dir
++	logsStorageDir := path.Join(storageDir, pathToContainersLogDir, id)
++	handler.extraDirs = append(handler.extraDirs, logsStorageDir)
++
++	// And start DiskUsageMetrics (if enabled)
++	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
++		// We need to find all our base dirs!
++		handler.fsHandler = newFsHandler(time.Minute, handler.baseDirs, handler.extraDirs, fsInfo)
++	}
++
+ 	return handler, nil
+ }
+ 
+@@ -287,10 +316,7 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
+ 	spec.CreationTime = self.creationTime
+ 
+ 	if !self.ignoreMetrics.Has(container.DiskUsageMetrics) {
+-		switch self.storageDriver {
+-		case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver:
+-			spec.HasFilesystem = true
+-		}
++		spec.HasFilesystem = true
+ 	}
+ 
+ 	spec.Labels = self.labels
+@@ -302,43 +328,19 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
+ }
+ 
+ func (self *dockerContainerHandler) getFsStats(stats *info.ContainerStats) error {
+-	if self.ignoreMetrics.Has(container.DiskUsageMetrics) {
+-		return nil
+-	}
+-	switch self.storageDriver {
+-	case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver:
+-	default:
++	if self.fsHandler == nil {
+ 		return nil
+ 	}
++	fsStats, err := self.fsHandler.usage()
+ 
+-	deviceInfo, err := self.fsInfo.GetDirFsDevice(self.rootfsStorageDir)
+-	if err != nil {
+-		return err
+-	}
+-
+-	mi, err := self.machineInfoFactory.GetMachineInfo()
+ 	if err != nil {
+ 		return err
+ 	}
+-	var (
+-		limit  uint64
+-		fsType string
+-	)
+ 
+-	// Docker does not impose any filesystem limits for containers. So use capacity as limit.
+-	for _, fs := range mi.Filesystems {
+-		if fs.Device == deviceInfo.Device {
+-			limit = fs.Capacity
+-			fsType = fs.Type
+-			break
+-		}
++	for _, stat := range fsStats {
++		stats.Filesystem = append(stats.Filesystem, *stat)
+ 	}
+ 
+-	fsStat := info.FsStats{Device: deviceInfo.Device, Type: fsType, Limit: limit}
+-
+-	fsStat.BaseUsage, fsStat.Usage = self.fsHandler.usage()
+-	stats.Filesystem = append(stats.Filesystem, fsStat)
+-
+ 	return nil
+ }
+ 
+diff --git a/container/raw/handler.go b/container/raw/handler.go
+index 94d3141..6de749a 100644
+--- a/container/raw/handler.go
++++ b/container/raw/handler.go
+@@ -291,7 +291,7 @@ func (self *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
+ func (self *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
+ 	// Get Filesystem information only for the root cgroup.
+ 	if isRootCgroup(self.name) {
+-		filesystems, err := self.fsInfo.GetGlobalFsInfo()
++		filesystems, err := self.fsInfo.GetGlobalFsInfo(true)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -323,7 +323,7 @@ func (self *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
+ 		for _, mount := range self.externalMounts {
+ 			mountSet[mount.HostDir] = struct{}{}
+ 		}
+-		filesystems, err := self.fsInfo.GetFsInfoForPath(mountSet)
++		filesystems, err := self.fsInfo.GetFsInfoForMounts(mountSet, true)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/fs/fs.go b/fs/fs.go
+index 458d8c4..3e05a99 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -83,52 +83,88 @@ func (self *RealFsInfo) GetMountpointForDevice(dev string) (string, error) {
+ 	return p.mountpoint, nil
+ }
+ 
+-func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error) {
+-	filesystems := make([]Fs, 0)
+-	deviceSet := make(map[string]struct{})
+-	diskStatsMap, err := getDiskStatsMap("/proc/diskstats")
++func (self *RealFsInfo) getFilteredFsInfo(filter func(device string, partition partition) bool, withIoStats bool) ([]Fs, error) {
++	filesystemsOut := make([]Fs, 0)
++
++	err := self.partitionCache.ApplyOverPartitions(func(device string, partition partition) error {
++		if !filter(device, partition) {
++			return nil
++		}
++
++		var (
++			err error
++			fs  Fs
++		)
++
++		switch partition.fsType {
++		case DeviceMapper.String():
++			fs.Capacity, fs.Free, fs.Available, err = getDMStats(device, partition.blockSize)
++			fs.Type = DeviceMapper
++		case ZFS.String():
++			fs.Capacity, fs.Free, fs.Available, err = getZfstats(device)
++			fs.Type = ZFS
++		default:
++			fs.Capacity, fs.Free, fs.Available, fs.Inodes, fs.InodesFree, err = getVfsStats(partition.mountpoint)
++			fs.Type = VFS
++		}
++
++		if err != nil {
++			// Only log, don't throw an error
++			glog.Errorf("Stat fs for %q failed. Error: %v", device, err)
++			return nil
++		}
++
++		fs.DeviceInfo = DeviceInfo{
++			Device: device,
++			Major:  uint(partition.major),
++			Minor:  uint(partition.minor),
++		}
++
++		filesystemsOut = append(filesystemsOut, fs)
++		return nil
++	})
++
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	self.partitionCache.ApplyOverPartitions(func(device string, partition partition) error {
+-		_, hasMount := mountSet[partition.mountpoint]
+-		_, hasDevice := deviceSet[device]
+-		if mountSet == nil || (hasMount && !hasDevice) {
+-			var (
+-				err error
+-				fs  Fs
+-			)
+-			switch partition.fsType {
+-			case DeviceMapper.String():
+-				fs.Capacity, fs.Free, fs.Available, err = getDMStats(device, partition.blockSize)
+-				fs.Type = DeviceMapper
+-			case ZFS.String():
+-				fs.Capacity, fs.Free, fs.Available, err = getZfstats(device)
+-				fs.Type = ZFS
+-			default:
+-				fs.Capacity, fs.Free, fs.Available, fs.Inodes, fs.InodesFree, err = getVfsStats(partition.mountpoint)
+-				fs.Type = VFS
+-			}
++	if withIoStats {
++		diskStatsMap, err := getDiskStatsMap("/proc/diskstats")
++		if err != nil {
++			return nil, err
++		}
+ 
+-			if err != nil {
+-				glog.Errorf("Stat fs failed. Error: %v", err)
+-			} else {
+-				deviceSet[device] = struct{}{}
+-				fs.DeviceInfo = DeviceInfo{
+-					Device: device,
+-					Major:  uint(partition.major),
+-					Minor:  uint(partition.minor),
+-				}
+-				fs.DiskStats = diskStatsMap[device]
+-				filesystems = append(filesystems, fs)
++		for _, fs := range filesystemsOut {
++			diskStats, ok := diskStatsMap[fs.DeviceInfo.Device]
++			if !ok {
++				glog.Errorf("Disk stats for %q not found", fs.DeviceInfo.Device)
++				continue
+ 			}
++			fs.DiskStats = diskStats
+ 		}
++	}
+ 
+-		return nil
+-	})
++	return filesystemsOut, nil
++}
++
++func (self *RealFsInfo) GetFsInfoForMounts(mountSet map[string]struct{}, withIoStats bool) ([]Fs, error) {
++	return self.getFilteredFsInfo(func(_ string, partition partition) bool {
++		_, hasMount := mountSet[partition.mountpoint]
++		return hasMount
++	}, withIoStats)
++}
+ 
+-	return filesystems, nil
++func (self *RealFsInfo) GetFsInfoForDevices(deviceSet map[string]struct{}, withIoStats bool) ([]Fs, error) {
++	return self.getFilteredFsInfo(func(device string, _ partition) bool {
++		_, hasDevice := deviceSet[device]
++		return hasDevice
++	}, withIoStats)
++}
++
++func (self *RealFsInfo) GetGlobalFsInfo(withIoStats bool) ([]Fs, error) {
++	return self.getFilteredFsInfo(func(_ string, _ partition) bool {
++		return true
++	}, withIoStats)
+ }
+ 
+ var partitionRegex = regexp.MustCompile(`^(?:(?:s|xv)d[a-z]+\d*|dm-\d+)$`)
+@@ -186,10 +222,6 @@ func getDiskStatsMap(diskStatsFile string) (map[string]DiskStats, error) {
+ 	return diskStatsMap, nil
+ }
+ 
+-func (self *RealFsInfo) GetGlobalFsInfo() ([]Fs, error) {
+-	return self.GetFsInfoForPath(nil)
+-}
+-
+ func major(devNumber uint64) uint {
+ 	return uint((devNumber >> 8) & 0xfff)
+ }
+diff --git a/fs/types.go b/fs/types.go
+index 17bc5f1..b345339 100644
+--- a/fs/types.go
++++ b/fs/types.go
+@@ -72,10 +72,13 @@ type FsInfo interface {
+ 	RefreshCache()
+ 
+ 	// Returns capacity and free space, in bytes, of all the ext2, ext3, ext4 filesystems on the host.
+-	GetGlobalFsInfo() ([]Fs, error)
++	GetGlobalFsInfo(withIoStats bool) ([]Fs, error)
+ 
+ 	// Returns capacity and free space, in bytes, of the set of mounts passed.
+-	GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error)
++	GetFsInfoForMounts(mountSet map[string]struct{}, withIoStats bool) ([]Fs, error)
++
++	// Returns capacity and free space, in bytes, of the set of devices passed.
++	GetFsInfoForDevices(deviceSet map[string]struct{}, withIoStats bool) ([]Fs, error)
+ 
+ 	// Returns number of bytes occupied by 'dir'.
+ 	GetDirUsage(dir string, timeout time.Duration) (uint64, error)
+diff --git a/manager/machine.go b/manager/machine.go
+index d459815..5dd362c 100644
+--- a/manager/machine.go
++++ b/manager/machine.go
+@@ -68,7 +68,7 @@ func getMachineInfo(sysFs sysfs.SysFs, fsInfo fs.FsInfo, inHostNamespace bool) (
+ 		return nil, err
+ 	}
+ 
+-	filesystems, err := fsInfo.GetGlobalFsInfo()
++	filesystems, err := fsInfo.GetGlobalFsInfo(false)
+ 	if err != nil {
+ 		glog.Errorf("Failed to get global filesystem information: %v", err)
+ 	}
+-- 
+2.7.4
+
