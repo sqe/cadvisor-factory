@@ -1,7 +1,7 @@
 From 478fe7627aecac7e51822588dd3a623e44f0d533 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 20:57:34 +0200
-Subject: [PATCH 7/7] Use a dedicated CpuLoadReader per container
+Subject: [PATCH] Use a dedicated CpuLoadReader per container
 
 This ensures each goroutine is given its own Netlink connection, and
 presumably avoids having a message destined for one goroutine read by
@@ -197,5 +197,5 @@ index 78b2592..e536d90 100644
  	return reader, nil
  }
 -- 
-1.9.1
+2.7.4
 

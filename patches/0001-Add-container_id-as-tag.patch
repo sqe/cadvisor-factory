@@ -1,7 +1,7 @@
 From 7a55128955105f3a8755a9abf1c384e7be9fc925 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 21:31:01 +0200
-Subject: [PATCH 1/7] Add container_id as tag
+Subject: [PATCH] Add container_id as tag
 
 Dereferenced aliases can be nice, but a predictable container ID is nice
 too.
@@ -30,5 +30,5 @@ index 82739b5..4aeb89d 100644
  	for i := 0; i < len(points); i++ {
  		// merge with existing tags if any
 -- 
-1.9.1
+2.7.4
 

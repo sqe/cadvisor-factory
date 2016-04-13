@@ -1,0 +1,38 @@
+From e3037c73dda77b71454637e62f5a965e755f4d86 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Thu, 7 Apr 2016 12:45:30 +0200
+Subject: [PATCH] Exit when unable to connect to Docker daemon
+
+Practically speaking, we'd rather have no cAdvisor than have a cAdvisor
+that doesn't report the metrics we care about. This change causes
+cAdvisor to exit if it can't connect to the Docker daemon (it'll then
+be restart by Upstart).
+---
+ manager/manager.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/manager/manager.go b/manager/manager.go
+index 701b22c..aa6d186 100644
+--- a/manager/manager.go
++++ b/manager/manager.go
+@@ -131,7 +131,7 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
+ 
+ 	dockerInfo, err := docker.DockerInfo()
+ 	if err != nil {
+-		glog.Warningf("Unable to connect to Docker: %v", err)
++		glog.Fatalf("Unable to connect to Docker: %v", err)
+ 	}
+ 	context := fs.Context{DockerRoot: docker.RootDir(), DockerInfo: dockerInfo}
+ 	fsInfo, err := fs.NewFsInfo(context)
+@@ -206,7 +206,7 @@ func (self *manager) Start() error {
+ 	// Register Docker container factory.
+ 	err := docker.Register(self, self.fsInfo, self.ignoreMetrics)
+ 	if err != nil {
+-		glog.Errorf("Docker container factory registration failed: %v.", err)
++		glog.Fatalf("Docker container factory registration failed: %v.", err)
+ 	}
+ 
+ 	// Register the raw driver.
+-- 
+2.7.4
+
