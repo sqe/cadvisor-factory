@@ -1,4 +1,4 @@
-From 478fe7627aecac7e51822588dd3a623e44f0d533 Mon Sep 17 00:00:00 2001
+From 8addb9254368ff63e7818b586e6966a3c05ef8fb Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 20:57:34 +0200
 Subject: [PATCH] Use a dedicated CpuLoadReader per container
@@ -15,7 +15,7 @@ another goroutine.
  5 files changed, 27 insertions(+), 31 deletions(-)
 
 diff --git a/manager/container.go b/manager/container.go
-index dffd50f..2384a3a 100644
+index 1309ade..5cf2ec0 100644
 --- a/manager/container.go
 +++ b/manager/container.go
 @@ -44,6 +44,7 @@ import (
@@ -26,7 +26,7 @@ index dffd50f..2384a3a 100644
  var HousekeepingInterval = flag.Duration("housekeeping_interval", 1*time.Second, "Interval between container housekeepings")
  
  var cgroupPathRegExp = regexp.MustCompile(`devices[^:]*:(.*?)[,;$]`)
-@@ -305,7 +306,7 @@ func (c *containerData) GetProcessList(cadvisorContainer string, inHostNamespace
+@@ -294,7 +295,7 @@ func (c *containerData) GetProcessList(cadvisorContainer string, inHostNamespace
  	return processes, nil
  }
  
@@ -35,7 +35,7 @@ index dffd50f..2384a3a 100644
  	if memoryCache == nil {
  		return nil, fmt.Errorf("nil memory storage")
  	}
-@@ -323,7 +324,6 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
+@@ -312,7 +313,6 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
  		housekeepingInterval:     *HousekeepingInterval,
  		maxHousekeepingInterval:  maxHousekeepingInterval,
  		allowDynamicHousekeeping: allowDynamicHousekeeping,
@@ -43,7 +43,7 @@ index dffd50f..2384a3a 100644
  		logUsage:                 logUsage,
  		loadAvg:                  -1.0, // negative value indicates uninitialized.
  		stop:                     make(chan bool, 1),
-@@ -333,6 +333,17 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
+@@ -322,6 +322,17 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
  
  	cont.loadDecay = math.Exp(float64(-cont.housekeepingInterval.Seconds() / 10))
  
@@ -61,7 +61,7 @@ index dffd50f..2384a3a 100644
  	err = cont.updateSpec()
  	if err != nil {
  		return nil, err
-@@ -377,6 +388,16 @@ func (self *containerData) nextHousekeeping(lastHousekeeping time.Time) time.Tim
+@@ -366,6 +377,16 @@ func (self *containerData) nextHousekeeping(lastHousekeeping time.Time) time.Tim
  func (c *containerData) housekeeping() {
  	// Start any background goroutines - must be cleaned up in c.handler.Cleanup().
  	c.handler.Start()
@@ -78,7 +78,7 @@ index dffd50f..2384a3a 100644
  
  	// Long housekeeping is either 100ms or half of the housekeeping interval.
  	longHousekeeping := 100 * time.Millisecond
-@@ -390,8 +411,6 @@ func (c *containerData) housekeeping() {
+@@ -379,8 +400,6 @@ func (c *containerData) housekeeping() {
  	for {
  		select {
  		case <-c.stop:
@@ -101,10 +101,10 @@ index 27b18d8..9bfee56 100644
  		t.Fatal(err)
  	}
 diff --git a/manager/manager.go b/manager/manager.go
-index eb8d2cb..701b22c 100644
+index 984368d..fd14f6b 100644
 --- a/manager/manager.go
 +++ b/manager/manager.go
-@@ -35,7 +35,6 @@ import (
+@@ -36,7 +36,6 @@ import (
  	"github.com/google/cadvisor/fs"
  	info "github.com/google/cadvisor/info/v1"
  	"github.com/google/cadvisor/info/v2"
@@ -112,7 +112,7 @@ index eb8d2cb..701b22c 100644
  	"github.com/google/cadvisor/utils/oomparser"
  	"github.com/google/cadvisor/utils/sysfs"
  
-@@ -45,7 +44,6 @@ import (
+@@ -46,7 +45,6 @@ import (
  
  var globalHousekeepingInterval = flag.Duration("global_housekeeping_interval", 1*time.Minute, "Interval between global housekeepings")
  var logCadvisorUsage = flag.Bool("log_cadvisor_usage", false, "Whether to log the usage of the cAdvisor container")
@@ -120,7 +120,7 @@ index eb8d2cb..701b22c 100644
  var eventStorageAgeLimit = flag.String("event_storage_age_limit", "default=24h", "Max length of time for which to store events (per type). Value is a comma separated list of key values, where the keys are event types (e.g.: creation, oom) or \"default\" and the value is a duration. Default is applied to all non-specified event types")
  var eventStorageEventLimit = flag.String("event_storage_event_limit", "default=100000", "Max number of events to store (per type). Value is a comma separated list of key values, where the keys are event types (e.g.: creation, oom) or \"default\" and the value is an integer. Default is applied to all non-specified event types")
  var applicationMetricsCountLimit = flag.Int("application_metrics_count_limit", 100, "Max number of application metrics to store (per container)")
-@@ -196,7 +194,6 @@ type manager struct {
+@@ -209,7 +207,6 @@ type manager struct {
  	quitChannels             []chan error
  	cadvisorContainer        string
  	inHostNamespace          bool
@@ -128,7 +128,7 @@ index eb8d2cb..701b22c 100644
  	eventHandler             events.EventManager
  	startupTime              time.Time
  	maxHousekeepingInterval  time.Duration
-@@ -221,22 +218,6 @@ func (self *manager) Start() error {
+@@ -242,22 +239,6 @@ func (self *manager) Start() error {
  	self.DockerInfo()
  	self.DockerImages()
  
@@ -151,10 +151,10 @@ index eb8d2cb..701b22c 100644
  	// Watch for OOMs.
  	err = self.watchForNewOoms()
  	if err != nil {
-@@ -289,10 +270,6 @@ func (self *manager) Stop() error {
+@@ -315,10 +296,6 @@ func (self *manager) Stop() error {
  		}
  	}
- 	self.quitChannels = make([]chan error, 0, 2)
+ 	self.quitChannels = make([]chan error, 0, 3)
 -	if self.loadReader != nil {
 -		self.loadReader.Stop()
 -		self.loadReader = nil
@@ -162,7 +162,7 @@ index eb8d2cb..701b22c 100644
  	return nil
  }
  
-@@ -777,7 +754,7 @@ func (m *manager) createContainer(containerName string) error {
+@@ -818,7 +795,7 @@ func (m *manager) createContainer(containerName string) error {
  	}
  
  	logUsage := *logCadvisorUsage && containerName == m.cadvisorContainer

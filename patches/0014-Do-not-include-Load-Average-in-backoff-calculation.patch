@@ -1,4 +1,4 @@
-From 03a61a55a1fd5afb045aa6a82754305a13b141ed Mon Sep 17 00:00:00 2001
+From 2d0a30441dde9b172bb2a0859794750a8157982f Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Tue, 5 Apr 2016 15:50:30 +0200
 Subject: [PATCH] Do not include Load Average in backoff calculation

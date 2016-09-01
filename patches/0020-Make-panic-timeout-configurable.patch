@@ -1,4 +1,4 @@
-From 4294dd05b9addb1dc44902947f1d3c997ed332a0 Mon Sep 17 00:00:00 2001
+From 9c14293419997d0540ea111a3804fa5eb0475915 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Tue, 12 Apr 2016 18:55:44 +0200
 Subject: [PATCH] Make panic timeout configurable
@@ -8,7 +8,7 @@ Subject: [PATCH] Make panic timeout configurable
  1 file changed, 6 insertions(+), 3 deletions(-)
 
 diff --git a/manager/container.go b/manager/container.go
-index 9ee2b53..1a4d7f3 100644
+index 7184b68..f21896d 100644
 --- a/manager/container.go
 +++ b/manager/container.go
 @@ -44,11 +44,14 @@ import (
@@ -27,7 +27,7 @@ index 9ee2b53..1a4d7f3 100644
  var cgroupPathRegExp = regexp.MustCompile(`devices[^:]*:(.*?)[,;$]`)
  
  type containerInfo struct {
-@@ -435,7 +438,7 @@ func (c *containerData) doHousekeepingLoop() {
+@@ -424,7 +427,7 @@ func (c *containerData) doHousekeepingLoop() {
  		default:
  			// Perform housekeeping.
  			start := time.Now()
@@ -36,7 +36,7 @@ index 9ee2b53..1a4d7f3 100644
  
  			// Log if housekeeping took too long.
  			duration := time.Since(start)
-@@ -610,7 +613,7 @@ func (c *containerData) doLoadReaderLoop() {
+@@ -599,7 +602,7 @@ func (c *containerData) doLoadReaderLoop() {
  		case <-c.loadStop:
  			return
  		default:

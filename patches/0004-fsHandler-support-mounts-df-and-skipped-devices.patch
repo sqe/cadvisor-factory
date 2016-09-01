@@ -1,4 +1,4 @@
-From adf36419085a4e3030ccb28e38f0900900369e6e Mon Sep 17 00:00:00 2001
+From dfeb60c78f2a71a94ac27c75811a7407393732ea Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Fri, 8 Apr 2016 16:28:57 +0200
 Subject: [PATCH] fsHandler: support mounts, df, and skipped devices
@@ -14,22 +14,23 @@ This makes 3 changes to fsHandler:
 - Third, it adds a flag that allows the user to submit a regex of
   devices to be ignored when reporting usage stats.
 ---
- container/docker/fsHandler.go      | 240 +++++++++++++++++++++-----
- container/docker/fsHandler_test.go | 333 +++++++++++++++++++++++++++++++++++++
- container/docker/handler.go        | 106 ++++++------
+ container/common/fsHandler.go      | 240 +++++++++++++++++++++-----
+ container/common/fsHandler_test.go | 333 +++++++++++++++++++++++++++++++++++++
+ container/docker/handler.go        | 102 ++++++------
  container/raw/handler.go           |   4 +-
+ container/rkt/handler.go           |  26 +--
  fs/fs.go                           | 114 ++++++++-----
  fs/types.go                        |   7 +-
  manager/machine.go                 |   2 +-
- 7 files changed, 671 insertions(+), 135 deletions(-)
- create mode 100644 container/docker/fsHandler_test.go
+ 8 files changed, 675 insertions(+), 153 deletions(-)
+ create mode 100644 container/common/fsHandler_test.go
 
-diff --git a/container/docker/fsHandler.go b/container/docker/fsHandler.go
-index c5b406a..3a5b5e2 100644
---- a/container/docker/fsHandler.go
-+++ b/container/docker/fsHandler.go
+diff --git a/container/common/fsHandler.go b/container/common/fsHandler.go
+index ec2e76a..98581f5 100644
+--- a/container/common/fsHandler.go
++++ b/container/common/fsHandler.go
 @@ -16,6 +16,10 @@
- package docker
+ package common
  
  import (
 +	"flag"
@@ -39,10 +40,16 @@ index c5b406a..3a5b5e2 100644
  	"sync"
  	"time"
  
-@@ -24,22 +28,60 @@ import (
- 	"github.com/golang/glog"
- )
+@@ -26,20 +30,58 @@ import (
  
+ type FsHandler interface {
+ 	Start()
+-	Usage() (baseUsageBytes uint64, totalUsageBytes uint64)
++	Usage() ([]*info.FsStats, error)
+ 	Stop()
++	update() error // Exposed privately for tests
++}
++
 +type skippedDevices struct {
 +	r *regexp.Regexp
 +}
@@ -77,14 +84,6 @@ index c5b406a..3a5b5e2 100644
 +
 +func init() {
 +	flag.Var(&skipDevicesFlag, "disk_skip_devices", "Regex representing devices to ignore when reporting disk metrics")
-+}
-+
- type fsHandler interface {
- 	start()
--	usage() (uint64, uint64)
- 	stop()
-+	usage() ([]*info.FsStats, error)
-+	update() error // Exposed privately for tests
  }
  
  type realFsHandler struct {
@@ -114,10 +113,10 @@ index c5b406a..3a5b5e2 100644
  )
  
 +// Enforce that realFsHandler conforms to fsHandler interface
- var _ fsHandler = &realFsHandler{}
+ var _ FsHandler = &realFsHandler{}
  
--func newFsHandler(period time.Duration, rootfs, extraDir string, fsInfo fs.FsInfo) fsHandler {
-+func newFsHandler(period time.Duration, baseDirs []string, extraDirs []string, fsInfo fs.FsInfo) fsHandler {
+-func NewFsHandler(period time.Duration, rootfs, extraDir string, fsInfo fs.FsInfo) FsHandler {
++func NewFsHandler(period time.Duration, baseDirs []string, extraDirs []string, fsInfo fs.FsInfo) FsHandler {
 +	allDirsSet := make(map[string]struct{})
 +	baseDirsSet := make(map[string]struct{})
 +
@@ -319,12 +318,12 @@ index c5b406a..3a5b5e2 100644
  			}
  		}
  	}
-@@ -127,8 +289,12 @@ func (fh *realFsHandler) stop() {
+@@ -127,8 +289,12 @@ func (fh *realFsHandler) Stop() {
  	close(fh.stopChan)
  }
  
--func (fh *realFsHandler) usage() (baseUsageBytes, totalUsageBytes uint64) {
-+func (fh *realFsHandler) usage() ([]*info.FsStats, error) {
+-func (fh *realFsHandler) Usage() (baseUsageBytes, totalUsageBytes uint64) {
++func (fh *realFsHandler) Usage() ([]*info.FsStats, error) {
  	fh.RLock()
  	defer fh.RUnlock()
 -	return fh.baseUsageBytes, fh.usageBytes
@@ -334,11 +333,11 @@ index c5b406a..3a5b5e2 100644
 +	}
 +	return fh.fsStats, nil
  }
-diff --git a/container/docker/fsHandler_test.go b/container/docker/fsHandler_test.go
+diff --git a/container/common/fsHandler_test.go b/container/common/fsHandler_test.go
 new file mode 100644
-index 0000000..46307ee
+index 0000000..508e2d1
 --- /dev/null
-+++ b/container/docker/fsHandler_test.go
++++ b/container/common/fsHandler_test.go
 @@ -0,0 +1,333 @@
 +// Copyright 2016 Google Inc. All Rights Reserved.
 +//
@@ -354,7 +353,7 @@ index 0000000..46307ee
 +// See the License for the specific language governing permissions and
 +// limitations under the License.
 +
-+package docker
++package common
 +
 +import (
 +	"fmt"
@@ -499,20 +498,20 @@ index 0000000..46307ee
 +	as := assert.New(t)
 +
 +	(*skipDuFlag) = false
-+	hdlr := newFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
++	hdlr := NewFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
 +		allowDirUsage: true,
 +		t:             t,
 +	})
 +
 +	// Usage before trackUsage should return an error
-+	usage, err := hdlr.usage()
++	usage, err := hdlr.Usage()
 +	as.Error(err)
 +	as.Equal(0, len(usage))
 +
 +	err = hdlr.update()
 +	as.NoError(err)
 +
-+	usage, err = hdlr.usage()
++	usage, err = hdlr.Usage()
 +	as.NoError(err)
 +
 +	foundSda1 := false
@@ -562,7 +561,7 @@ index 0000000..46307ee
 +	as := assert.New(t)
 +
 +	(*skipDuFlag) = true
-+	hdlr := newFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
++	hdlr := NewFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
 +		allowDirUsage: false,
 +		t:             t,
 +	})
@@ -570,7 +569,7 @@ index 0000000..46307ee
 +	err := hdlr.update()
 +	as.NoError(err)
 +
-+	usage, err := hdlr.usage()
++	usage, err := hdlr.Usage()
 +	as.NoError(err)
 +
 +	foundSda1 := false
@@ -615,7 +614,7 @@ index 0000000..46307ee
 +
 +	(*skipDuFlag) = true
 +	skipDevicesFlag.Set("/dev/sda\\d")
-+	hdlr := newFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
++	hdlr := NewFsHandler(time.Second, testBaseDirs, testExtraDirs, &testFsInfo{
 +		allowDirUsage: false,
 +		t:             t,
 +	})
@@ -623,7 +622,7 @@ index 0000000..46307ee
 +	err := hdlr.update()
 +	as.NoError(err)
 +
-+	usage, err := hdlr.usage()
++	usage, err := hdlr.Usage()
 +	as.NoError(err)
 +
 +	foundSdb1 := false
@@ -655,7 +654,7 @@ index 0000000..46307ee
 +
 +	(*skipDuFlag) = false
 +	skipDevicesFlag.Set("/dev/sdc1")
-+	hdlr := newFsHandler(time.Second, []string{"/sdcmount"}, []string{}, &testFsInfo{
++	hdlr := NewFsHandler(time.Second, []string{"/sdcmount"}, []string{}, &testFsInfo{
 +		allowDirUsage: true,
 +		t:             t,
 +	})
@@ -663,7 +662,7 @@ index 0000000..46307ee
 +	err := hdlr.update()
 +	as.NoError(err)
 +
-+	usage, err := hdlr.usage()
++	usage, err := hdlr.Usage()
 +	as.NoError(err)
 +
 +	for _, stat := range usage {
@@ -674,18 +673,18 @@ index 0000000..46307ee
 +	}
 +}
 diff --git a/container/docker/handler.go b/container/docker/handler.go
-index bfdbeb2..38285bf 100644
+index 74c1753..2421593 100644
 --- a/container/docker/handler.go
 +++ b/container/docker/handler.go
-@@ -30,6 +30,7 @@ import (
- 	"github.com/google/cadvisor/utils"
+@@ -29,6 +29,7 @@ import (
+ 	info "github.com/google/cadvisor/info/v1"
  
  	docker "github.com/fsouza/go-dockerclient"
 +	"github.com/golang/glog"
  	"github.com/opencontainers/runc/libcontainer/cgroups"
  	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
  	libcontainerconfigs "github.com/opencontainers/runc/libcontainer/configs"
-@@ -39,7 +40,7 @@ const (
+@@ -38,7 +39,7 @@ const (
  	// The read write layers exist here.
  	aufsRWLayer = "diff"
  	// Path to the directory where docker stores log files if the json logging driver is enabled.
@@ -694,7 +693,7 @@ index bfdbeb2..38285bf 100644
  )
  
  type dockerContainerHandler struct {
-@@ -56,9 +57,8 @@ type dockerContainerHandler struct {
+@@ -55,9 +56,8 @@ type dockerContainerHandler struct {
  	// Manager of this container's cgroups.
  	cgroupManager cgroups.Manager
  
@@ -706,7 +705,7 @@ index bfdbeb2..38285bf 100644
  
  	// Time at which this container was created.
  	creationTime time.Time
-@@ -67,6 +67,10 @@ type dockerContainerHandler struct {
+@@ -66,6 +66,10 @@ type dockerContainerHandler struct {
  	labels map[string]string
  	envs   map[string]string
  
@@ -717,7 +716,7 @@ index bfdbeb2..38285bf 100644
  	// The container PID used to switch namespaces as required
  	pid int
  
-@@ -137,21 +141,10 @@ func newDockerContainerHandler(
+@@ -136,21 +140,10 @@ func newDockerContainerHandler(
  
  	id := ContainerNameToDockerId(name)
  
@@ -739,7 +738,7 @@ index bfdbeb2..38285bf 100644
  
  	handler := &dockerContainerHandler{
  		id:                 id,
-@@ -163,15 +156,10 @@ func newDockerContainerHandler(
+@@ -162,15 +155,10 @@ func newDockerContainerHandler(
  		storageDriver:      storageDriver,
  		fsInfo:             fsInfo,
  		rootFs:             rootFs,
@@ -749,16 +748,17 @@ index bfdbeb2..38285bf 100644
  	}
  
 -	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
--		handler.fsHandler = newFsHandler(time.Minute, rootfsStorageDir, otherStorageDir, fsInfo)
+-		handler.fsHandler = common.NewFsHandler(time.Minute, rootfsStorageDir, otherStorageDir, fsInfo)
 -	}
 -
  	// We assume that if Inspect fails then the container is not known to docker.
  	ctnr, err := client.InspectContainer(id)
  	if err != nil {
-@@ -196,6 +184,47 @@ func newDockerContainerHandler(
+@@ -195,6 +183,47 @@ func newDockerContainerHandler(
  		}
  	}
  
++	// Find the directories mounted in the container.
 +	handler.baseDirs = make([]string, 0)
 +	handler.extraDirs = make([]string, 0)
 +
@@ -796,26 +796,13 @@ index bfdbeb2..38285bf 100644
 +
 +	// And start DiskUsageMetrics (if enabled)
 +	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
-+		// We need to find all our base dirs!
-+		handler.fsHandler = newFsHandler(time.Minute, handler.baseDirs, handler.extraDirs, fsInfo)
++		handler.fsHandler = common.NewFsHandler(time.Minute, handler.baseDirs, handler.extraDirs, fsInfo)
 +	}
 +
  	return handler, nil
  }
  
-@@ -287,10 +316,7 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
- 	spec.CreationTime = self.creationTime
- 
- 	if !self.ignoreMetrics.Has(container.DiskUsageMetrics) {
--		switch self.storageDriver {
--		case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver:
--			spec.HasFilesystem = true
--		}
-+		spec.HasFilesystem = true
- 	}
- 
- 	spec.Labels = self.labels
-@@ -302,43 +328,19 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
+@@ -239,44 +268,19 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
  }
  
  func (self *dockerContainerHandler) getFsStats(stats *info.ContainerStats) error {
@@ -828,7 +815,7 @@ index bfdbeb2..38285bf 100644
 +	if self.fsHandler == nil {
  		return nil
  	}
-+	fsStats, err := self.fsHandler.usage()
++	fsStats, err := self.fsHandler.Usage()
  
 -	deviceInfo, err := self.fsInfo.GetDirFsDevice(self.rootfsStorageDir)
 -	if err != nil {
@@ -839,11 +826,12 @@ index bfdbeb2..38285bf 100644
  	if err != nil {
  		return err
  	}
+ 
 -	var (
 -		limit  uint64
 -		fsType string
 -	)
- 
+-
 -	// Docker does not impose any filesystem limits for containers. So use capacity as limit.
 -	for _, fs := range mi.Filesystems {
 -		if fs.Device == deviceInfo.Device {
@@ -857,17 +845,17 @@ index bfdbeb2..38285bf 100644
  
 -	fsStat := info.FsStats{Device: deviceInfo.Device, Type: fsType, Limit: limit}
 -
--	fsStat.BaseUsage, fsStat.Usage = self.fsHandler.usage()
+-	fsStat.BaseUsage, fsStat.Usage = self.fsHandler.Usage()
 -	stats.Filesystem = append(stats.Filesystem, fsStat)
 -
  	return nil
  }
  
 diff --git a/container/raw/handler.go b/container/raw/handler.go
-index 94d3141..6de749a 100644
+index 0e55046..5789bab 100644
 --- a/container/raw/handler.go
 +++ b/container/raw/handler.go
-@@ -291,7 +291,7 @@ func (self *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
+@@ -180,7 +180,7 @@ func (self *rawContainerHandler) GetSpec() (info.ContainerSpec, error) {
  func (self *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
  	// Get Filesystem information only for the root cgroup.
  	if isRootCgroup(self.name) {
@@ -876,7 +864,7 @@ index 94d3141..6de749a 100644
  		if err != nil {
  			return err
  		}
-@@ -323,7 +323,7 @@ func (self *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
+@@ -212,7 +212,7 @@ func (self *rawContainerHandler) getFsStats(stats *info.ContainerStats) error {
  		for _, mount := range self.externalMounts {
  			mountSet[mount.HostDir] = struct{}{}
  		}
@@ -885,11 +873,64 @@ index 94d3141..6de749a 100644
  		if err != nil {
  			return err
  		}
+diff --git a/container/rkt/handler.go b/container/rkt/handler.go
+index 31ca970..8f76b17 100644
+--- a/container/rkt/handler.go
++++ b/container/rkt/handler.go
+@@ -152,7 +152,7 @@ func newRktContainerHandler(name string, rktClient rktapi.PublicAPIClient, rktPa
+ 	}
+ 
+ 	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
+-		handler.fsHandler = common.NewFsHandler(time.Minute, rootfsStorageDir, "", fsInfo)
++		handler.fsHandler = common.NewFsHandler(time.Minute, []string{rootfsStorageDir}, []string{}, fsInfo)
+ 	}
+ 
+ 	return handler, nil
+@@ -200,35 +200,19 @@ func (handler *rktContainerHandler) GetSpec() (info.ContainerSpec, error) {
+ }
+ 
+ func (handler *rktContainerHandler) getFsStats(stats *info.ContainerStats) error {
+-	if handler.ignoreMetrics.Has(container.DiskUsageMetrics) {
++	if handler.fsHandler == nil {
+ 		return nil
+ 	}
++	fsStats, err := handler.fsHandler.Usage()
+ 
+-	deviceInfo, err := handler.fsInfo.GetDirFsDevice(handler.rootfsStorageDir)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	mi, err := handler.machineInfoFactory.GetMachineInfo()
+-	if err != nil {
+-		return err
+-	}
+-	var limit uint64 = 0
+-
+-	// Use capacity as limit.
+-	for _, fs := range mi.Filesystems {
+-		if fs.Device == deviceInfo.Device {
+-			limit = fs.Capacity
+-			break
+-		}
++	for _, stat := range fsStats {
++		stats.Filesystem = append(stats.Filesystem, *stat)
+ 	}
+ 
+-	fsStat := info.FsStats{Device: deviceInfo.Device, Limit: limit}
+-
+-	fsStat.BaseUsage, fsStat.Usage = handler.fsHandler.Usage()
+-
+-	stats.Filesystem = append(stats.Filesystem, fsStat)
+-
+ 	return nil
+ }
+ 
 diff --git a/fs/fs.go b/fs/fs.go
-index 458d8c4..3e05a99 100644
+index 998e657..ec6c477 100644
 --- a/fs/fs.go
 +++ b/fs/fs.go
-@@ -83,52 +83,88 @@ func (self *RealFsInfo) GetMountpointForDevice(dev string) (string, error) {
+@@ -89,52 +89,88 @@ func (self *RealFsInfo) GetMountpointForDevice(dev string) (string, error) {
  	return p.mountpoint, nil
  }
  
@@ -1015,7 +1056,7 @@ index 458d8c4..3e05a99 100644
  }
  
  var partitionRegex = regexp.MustCompile(`^(?:(?:s|xv)d[a-z]+\d*|dm-\d+)$`)
-@@ -186,10 +222,6 @@ func getDiskStatsMap(diskStatsFile string) (map[string]DiskStats, error) {
+@@ -192,10 +228,6 @@ func getDiskStatsMap(diskStatsFile string) (map[string]DiskStats, error) {
  	return diskStatsMap, nil
  }
  

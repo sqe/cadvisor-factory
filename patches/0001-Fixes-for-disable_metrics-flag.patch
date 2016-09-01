@@ -1,0 +1,79 @@
+From 12676e52046cdf834a45e09418f3a2ce5a1d17bd Mon Sep 17 00:00:00 2001
+From: "Tim St. Clair" <stclair@google.com>
+Date: Mon, 2 May 2016 22:47:37 -0700
+Subject: [PATCH] Fixes for --disable_metrics flag
+
+1. Fix for writing to nil map when value is non-empty.
+2. Fix the usage string: go flag package uses backticks for the flag
+name.
+3. Render the flag default value in the same format as the flag accepts.
+---
+ cadvisor.go      | 10 +++++++---
+ cadvisor_test.go | 22 ++++++++++++++++++----
+ 2 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/cadvisor.go b/cadvisor.go
+index 403d198..f52ac90 100644
+--- a/cadvisor.go
++++ b/cadvisor.go
+@@ -72,11 +72,15 @@ type metricSetValue struct {
+ }
+ 
+ func (ml *metricSetValue) String() string {
+-	return fmt.Sprint(*ml)
++	var values []string
++	for metric, _ := range ml.MetricSet {
++		values = append(values, string(metric))
++	}
++	return strings.Join(values, ",")
+ }
+ 
+ func (ml *metricSetValue) Set(value string) error {
+-	ignoreMetrics = metricSetValue{}
++	ml.MetricSet = container.MetricSet{}
+ 	if value == "" {
+ 		return nil
+ 	}
+@@ -91,7 +95,7 @@ func (ml *metricSetValue) Set(value string) error {
+ }
+ 
+ func init() {
+-	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of metrics to be disabled. Options are `disk`, `network`, `tcp`. Note: tcp is disabled by default due to high CPU usage.")
++	flag.Var(&ignoreMetrics, "disable_metrics", "comma-separated list of `metrics` to be disabled. Options are 'disk', 'network', 'tcp'. Note: tcp is disabled by default due to high CPU usage.")
+ }
+ 
+ func main() {
+diff --git a/cadvisor_test.go b/cadvisor_test.go
+index ec341ec..4c326f1 100644
+--- a/cadvisor_test.go
++++ b/cadvisor_test.go
+@@ -28,8 +28,22 @@ func TestTcpMetricsAreDisabledByDefault(t *testing.T) {
+ 	assert.True(t, ignoreMetrics.Has(container.NetworkTcpUsageMetrics))
+ }
+ 
+-func TestTcpMetricsAreEnabledOnDemand(t *testing.T) {
+-	assert.True(t, ignoreMetrics.Has(container.NetworkTcpUsageMetrics))
+-	ignoreMetrics.Set("")
+-	assert.False(t, ignoreMetrics.Has(container.NetworkTcpUsageMetrics))
++func TestIgnoreMetrics(t *testing.T) {
++	tests := []struct {
++		value    string
++		expected []container.MetricKind
++	}{
++		{"", []container.MetricKind{}},
++		{"disk", []container.MetricKind{container.DiskUsageMetrics}},
++		{"disk,tcp,network", []container.MetricKind{container.DiskUsageMetrics, container.NetworkTcpUsageMetrics, container.NetworkUsageMetrics}},
++	}
++
++	for _, test := range tests {
++		assert.NoError(t, ignoreMetrics.Set(test.value))
++
++		assert.Equal(t, len(test.expected), len(ignoreMetrics.MetricSet))
++		for _, expected := range test.expected {
++			assert.True(t, ignoreMetrics.Has(expected), "Missing %s", expected)
++		}
++	}
+ }
+-- 
+2.7.4
+

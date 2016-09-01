@@ -1,0 +1,48 @@
+From f0e6f5e515ea98ae2d095c30fb9f32b1170054a0 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Thu, 1 Sep 2016 16:26:12 +0200
+Subject: [PATCH] Deference symlinks when loading partition list
+
+---
+ fs/mount_helper.go | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/fs/mount_helper.go b/fs/mount_helper.go
+index 671371b..71aea07 100644
+--- a/fs/mount_helper.go
++++ b/fs/mount_helper.go
+@@ -18,6 +18,7 @@ package fs
+ 
+ import (
+ 	dockerMountInfo "github.com/docker/docker/pkg/mount"
++	"path/filepath"
+ )
+ 
+ type mountInfoClient interface {
+@@ -27,7 +28,22 @@ type mountInfoClient interface {
+ type defaultMountInfoClient struct{}
+ 
+ func (*defaultMountInfoClient) GetMounts() ([]*dockerMountInfo.Info, error) {
+-	return dockerMountInfo.GetMounts()
++	mounts, err := dockerMountInfo.GetMounts()
++	if err != nil {
++		return nil, err
++	}
++
++	for _, mount := range mounts {
++		// Dereference the device name to account for symlinks (e.g. /dev/disk/by-uuid/...)
++		// Not all mounts can be de-referenced though, so we skip silently mounts that cannot.
++		deviceName, err := filepath.EvalSymlinks(mount.Source)
++		if err != nil {
++			continue
++		}
++		mount.Source = deviceName
++	}
++
++	return mounts, nil
+ }
+ 
+ var _ mountInfoClient = &defaultMountInfoClient{}
+-- 
+2.7.4
+

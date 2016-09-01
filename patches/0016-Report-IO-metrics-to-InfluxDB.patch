@@ -1,4 +1,4 @@
-From e0c90674b14344c08e18eeac8ed3b1d3c34e1a89 Mon Sep 17 00:00:00 2001
+From aa7b93d65b6549ef7018d6106d4a4df632f02fba Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Wed, 6 Apr 2016 19:03:34 +0200
 Subject: [PATCH] Report IO metrics to InfluxDB

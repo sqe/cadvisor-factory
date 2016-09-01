@@ -1,4 +1,4 @@
-From e3037c73dda77b71454637e62f5a965e755f4d86 Mon Sep 17 00:00:00 2001
+From ae966bdc79adbb6600de6a59fd0d0b706b31541b Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Thu, 7 Apr 2016 12:45:30 +0200
 Subject: [PATCH] Exit when unable to connect to Docker daemon
@@ -12,27 +12,27 @@ be restart by Upstart).
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/manager/manager.go b/manager/manager.go
-index 701b22c..aa6d186 100644
+index fd14f6b..b30d12d 100644
 --- a/manager/manager.go
 +++ b/manager/manager.go
-@@ -131,7 +131,7 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
+@@ -132,7 +132,7 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, maxHousekeepingIn
  
- 	dockerInfo, err := docker.DockerInfo()
+ 	dockerInfo, err := dockerInfo()
  	if err != nil {
 -		glog.Warningf("Unable to connect to Docker: %v", err)
 +		glog.Fatalf("Unable to connect to Docker: %v", err)
  	}
- 	context := fs.Context{DockerRoot: docker.RootDir(), DockerInfo: dockerInfo}
- 	fsInfo, err := fs.NewFsInfo(context)
-@@ -206,7 +206,7 @@ func (self *manager) Start() error {
- 	// Register Docker container factory.
+ 	rktPath, err := rkt.RktPath()
+ 	if err != nil {
+@@ -218,7 +218,7 @@ type manager struct {
+ func (self *manager) Start() error {
  	err := docker.Register(self, self.fsInfo, self.ignoreMetrics)
  	if err != nil {
 -		glog.Errorf("Docker container factory registration failed: %v.", err)
 +		glog.Fatalf("Docker container factory registration failed: %v.", err)
  	}
  
- 	// Register the raw driver.
+ 	err = rkt.Register(self, self.fsInfo, self.ignoreMetrics)
 -- 
 2.7.4
 

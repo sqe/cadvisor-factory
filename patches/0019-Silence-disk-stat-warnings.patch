@@ -1,4 +1,4 @@
-From f69b933965d45e27362a9934a9d87ce49bcbbb2b Mon Sep 17 00:00:00 2001
+From 8eb63bd15bae26244f08229b8e8cfc37bb170cf9 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Tue, 12 Apr 2016 14:42:09 +0200
 Subject: [PATCH] Silence disk stat warnings
@@ -14,10 +14,10 @@ if they are missing.
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/fs/fs.go b/fs/fs.go
-index a7dd4c8..d9dbefe 100644
+index 81f0934..44fdae9 100644
 --- a/fs/fs.go
 +++ b/fs/fs.go
-@@ -135,7 +135,11 @@ func (self *RealFsInfo) getFilteredFsInfo(filter func(device string, partition p
+@@ -142,7 +142,11 @@ func (self *RealFsInfo) getFilteredFsInfo(filter func(_ string, _ partition) boo
  		for _, fs := range filesystemsOut {
  			diskStats, ok := diskStatsMap[fs.DeviceInfo.Device]
  			if !ok {
