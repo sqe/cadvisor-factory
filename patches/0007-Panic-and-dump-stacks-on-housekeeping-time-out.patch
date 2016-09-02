@@ -1,4 +1,4 @@
-From 18d4b36a15c9dd3137e71b7eb3e31f80f6797b25 Mon Sep 17 00:00:00 2001
+From ca30c311a7b7d13e2e1621eff703cdc49724521d Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Fri, 1 Apr 2016 11:23:38 +0200
 Subject: [PATCH] Panic and dump stacks on housekeeping time out
@@ -11,10 +11,10 @@ somewhat hard to debug otherwise).
  1 file changed, 21 insertions(+), 4 deletions(-)
 
 diff --git a/manager/container.go b/manager/container.go
-index b1d8d33..baae002 100644
+index 531604b..d5f4bb4 100644
 --- a/manager/container.go
 +++ b/manager/container.go
-@@ -28,6 +28,8 @@ import (
+@@ -27,6 +27,8 @@ import (
  	"strings"
  	"sync"
  	"time"
@@ -23,7 +23,7 @@ index b1d8d33..baae002 100644
  
  	"github.com/google/cadvisor/cache/memory"
  	"github.com/google/cadvisor/collector"
-@@ -444,11 +446,26 @@ func (c *containerData) housekeeping() {
+@@ -433,11 +435,26 @@ func (c *containerData) housekeeping() {
  }
  
  func (c *containerData) housekeepingTick() {

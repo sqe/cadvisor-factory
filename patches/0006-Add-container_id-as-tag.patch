@@ -1,4 +1,4 @@
-From 7a55128955105f3a8755a9abf1c384e7be9fc925 Mon Sep 17 00:00:00 2001
+From 66a6f7f50ceaccf47dcab12a0d26cb1eab861cc4 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 21:31:01 +0200
 Subject: [PATCH] Add container_id as tag

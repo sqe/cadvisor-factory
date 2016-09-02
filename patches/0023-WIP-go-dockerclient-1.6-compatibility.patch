@@ -1,0 +1,245 @@
+From bc44ba8296bb789c0187b44c1e751687d61e3686 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Thu, 1 Sep 2016 17:50:41 +0200
+Subject: [PATCH] WIP - go-dockerclient 1.6 compatibility
+
+https://github.com/google/cadvisor/issues/1214
+---
+ Godeps/Godeps.json                                 | 37 +++++++++----------
+ .../external/golang.org/x/sys/unix/mkall.sh        |  0
+ .../external/golang.org/x/sys/unix/mkerrors.sh     |  0
+ .../external/golang.org/x/sys/unix/mksyscall.pl    |  0
+ .../golang.org/x/sys/unix/mksyscall_solaris.pl     |  0
+ .../golang.org/x/sys/unix/mksysctl_openbsd.pl      |  0
+ .../golang.org/x/sys/unix/mksysnum_darwin.pl       |  0
+ .../golang.org/x/sys/unix/mksysnum_dragonfly.pl    |  0
+ .../golang.org/x/sys/unix/mksysnum_freebsd.pl      |  0
+ .../golang.org/x/sys/unix/mksysnum_linux.pl        |  0
+ .../golang.org/x/sys/unix/mksysnum_netbsd.pl       |  0
+ .../golang.org/x/sys/unix/mksysnum_openbsd.pl      |  0
+ .../src/github.com/fsouza/go-dockerclient/misc.go  | 42 +++++++++++++++-------
+ 13 files changed, 48 insertions(+), 31 deletions(-)
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mkall.sh
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mkerrors.sh
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksyscall.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksyscall_solaris.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysctl_openbsd.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_darwin.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_dragonfly.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_freebsd.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_linux.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_netbsd.pl
+ mode change 100644 => 100755 Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_openbsd.pl
+
+diff --git a/Godeps/Godeps.json b/Godeps/Godeps.json
+index 9da7353..5af6ed0 100644
+--- a/Godeps/Godeps.json
++++ b/Godeps/Godeps.json
+@@ -1,6 +1,7 @@
+ {
+ 	"ImportPath": "github.com/google/cadvisor",
+ 	"GoVersion": "go1.5.3",
++	"GodepVersion": "v74",
+ 	"Packages": [
+ 		"./..."
+ 	],
+@@ -154,75 +155,75 @@
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/Sirupsen/logrus",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/opts",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/archive",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/fileutils",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/homedir",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/idtools",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/ioutils",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/longpath",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/pools",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/promise",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/stdcopy",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/system",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/docker/go-units",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/hashicorp/go-cleanhttp",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/github.com/opencontainers/runc/libcontainer/user",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/golang.org/x/net/context",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix",
+-			"Rev": "ff3d4ee4753705a048db1855113026395c26a79a"
++			"Rev": "f30651f746f9462eb58f7233eefc587ceecd0f9f"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/garyburd/redigo/internal",
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mkall.sh b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mkall.sh
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mkerrors.sh b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mkerrors.sh
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksyscall.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksyscall.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksyscall_solaris.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksyscall_solaris.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysctl_openbsd.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysctl_openbsd.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_darwin.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_darwin.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_dragonfly.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_dragonfly.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_freebsd.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_freebsd.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_linux.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_linux.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_netbsd.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_netbsd.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_openbsd.pl b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/external/golang.org/x/sys/unix/mksysnum_openbsd.pl
+old mode 100644
+new mode 100755
+diff --git a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/misc.go b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/misc.go
+index ce9e975..dc9b8b7 100644
+--- a/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/misc.go
++++ b/Godeps/_workspace/src/github.com/fsouza/go-dockerclient/misc.go
+@@ -7,8 +7,24 @@ package docker
+ import (
+ 	"encoding/json"
+ 	"strings"
++	"errors"
++	"fmt"
+ )
+ 
++type ConvertibleBool bool
++
++func (bit ConvertibleBool) UnmarshalJSON(data []byte) error {
++    asString := string(data)
++    if asString == "1" || asString == "true" {
++        bit = true
++    } else if asString == "0" || asString == "false" {
++        bit = false
++    } else {
++        return errors.New(fmt.Sprintf("Boolean unmarshal error: invalid input %s", asString))
++    }
++    return nil
++}
++
+ // Version returns version information about the docker server.
+ //
+ // See https://goo.gl/ND9R8L for more details.
+@@ -39,19 +55,19 @@ type DockerInfo struct {
+ 	DriverStatus       [][2]string
+ 	SystemStatus       [][2]string
+ 	Plugins            PluginsInfo
+-	MemoryLimit        bool
+-	SwapLimit          bool
+-	KernelMemory       bool
+-	CPUCfsPeriod       bool `json:"CpuCfsPeriod"`
+-	CPUCfsQuota        bool `json:"CpuCfsQuota"`
+-	CPUShares          bool
+-	CPUSet             bool
+-	IPv4Forwarding     bool
+-	BridgeNfIptables   bool
+-	BridgeNfIP6tables  bool `json:"BridgeNfIp6tables"`
+-	Debug              bool
++	MemoryLimit        ConvertibleBool
++	SwapLimit          ConvertibleBool
++	KernelMemory       ConvertibleBool
++	CPUCfsPeriod       ConvertibleBool `json:"CpuCfsPeriod"`
++	CPUCfsQuota        ConvertibleBool `json:"CpuCfsQuota"`
++	CPUShares          ConvertibleBool
++	CPUSet             ConvertibleBool
++	IPv4Forwarding     ConvertibleBool
++	BridgeNfIptables   ConvertibleBool
++	BridgeNfIP6tables  ConvertibleBool `json:"BridgeNfIp6tables"`
++	Debug              ConvertibleBool
+ 	NFd                int
+-	OomKillDisable     bool
++	OomKillDisable     ConvertibleBool
+ 	NGoroutines        int
+ 	SystemTime         string
+ 	ExecutionDriver    string
+@@ -71,7 +87,7 @@ type DockerInfo struct {
+ 	NoProxy            string
+ 	Name               string
+ 	Labels             []string
+-	ExperimentalBuild  bool
++	ExperimentalBuild  ConvertibleBool
+ 	ServerVersion      string
+ 	ClusterStore       string
+ 	ClusterAdvertise   string
+-- 
+2.7.4
+

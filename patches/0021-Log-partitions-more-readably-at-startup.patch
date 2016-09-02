@@ -1,0 +1,34 @@
+From 8b8507bf88c14393b60c84267f2e8ae6daa8c434 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Thu, 1 Sep 2016 16:25:58 +0200
+Subject: [PATCH] Log partitions more readably at startup
+
+---
+ fs/fs.go | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/fs/fs.go b/fs/fs.go
+index 44fdae9..d40af43 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -56,14 +56,12 @@ func NewFsInfo(context Context) (FsInfo, error) {
+ 		fsStatsCache:   NewFsStatsCache(),
+ 	}
+ 
+-	partitions := make([]partition, 0)
+-	fsInfo.partitionCache.ApplyOverPartitions(func(_ string, p partition) error {
+-		partitions = append(partitions, p)
++	glog.Infof("Listing filesystem partitions:")
++	fsInfo.partitionCache.ApplyOverPartitions(func(d string, p partition) error {
++		glog.Infof("%s: %+v", d, p)
+ 		return nil
+ 	})
+ 
+-	glog.Infof("Filesystem partitions: %+v", partitions)
+-
+ 	return fsInfo, nil
+ }
+ 
+-- 
+2.7.4
+

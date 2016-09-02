@@ -1,4 +1,4 @@
-From b71242f12184bf59ea2326833939d8d37fcc6f59 Mon Sep 17 00:00:00 2001
+From bbded85d425f7dbbb75ac8c5b73e0239c894ebe1 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 17:59:38 +0200
 Subject: [PATCH] Probe LA independent of housekeeping interval
@@ -9,17 +9,18 @@ draw more so than on the actual value). This updates the container
 manager to run the LA probe on a different schedule from the regular
 housekeeping, and uses the last observed value when reporting.
 ---
- manager/container.go | 128 ++++++++++++++++++++++++++++++++++++++++-----------
- 1 file changed, 101 insertions(+), 27 deletions(-)
+ manager/container.go | 129 ++++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 102 insertions(+), 27 deletions(-)
 
 diff --git a/manager/container.go b/manager/container.go
-index 2384a3a..2f1e5fb 100644
+index 5cf2ec0..9e6537b 100644
 --- a/manager/container.go
 +++ b/manager/container.go
-@@ -20,16 +20,16 @@ import (
+@@ -19,16 +19,17 @@ import (
+ 	"fmt"
  	"io/ioutil"
  	"math"
- 	"math/rand"
++	"math/rand"
 +	"os"
  	"os/exec"
  	"path"
@@ -35,7 +36,7 @@ index 2384a3a..2f1e5fb 100644
  
  	"github.com/google/cadvisor/cache/memory"
  	"github.com/google/cadvisor/collector"
-@@ -46,6 +46,7 @@ import (
+@@ -46,6 +47,7 @@ import (
  // Housekeeping interval.
  var enableLoadReader = flag.Bool("enable_load_reader", false, "Whether to enable cpu load reader")
  var HousekeepingInterval = flag.Duration("housekeeping_interval", 1*time.Second, "Interval between container housekeepings")
@@ -43,7 +44,7 @@ index 2384a3a..2f1e5fb 100644
  
  var cgroupPathRegExp = regexp.MustCompile(`devices[^:]*:(.*?)[,;$]`)
  
-@@ -62,15 +63,23 @@ type containerData struct {
+@@ -62,15 +64,23 @@ type containerData struct {
  	lock                     sync.Mutex
  	loadReader               cpuload.CpuLoadReader
  	summaryReader            *summary.StatsSummary
@@ -68,7 +69,7 @@ index 2384a3a..2f1e5fb 100644
  
  	// Whether to log the usage of this container when it is updated.
  	logUsage bool
-@@ -94,7 +103,8 @@ func jitter(duration time.Duration, maxFactor float64) time.Duration {
+@@ -83,7 +93,8 @@ type containerData struct {
  }
  
  func (c *containerData) Start() error {
@@ -78,7 +79,7 @@ index 2384a3a..2f1e5fb 100644
  	return nil
  }
  
-@@ -104,6 +114,7 @@ func (c *containerData) Stop() error {
+@@ -93,6 +104,7 @@ func (c *containerData) Stop() error {
  		return err
  	}
  	c.stop <- true
@@ -86,7 +87,7 @@ index 2384a3a..2f1e5fb 100644
  	return nil
  }
  
-@@ -326,13 +337,14 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
+@@ -315,13 +327,14 @@ func newContainerData(containerName string, memoryCache *memory.InMemoryCache, h
  		allowDynamicHousekeeping: allowDynamicHousekeeping,
  		logUsage:                 logUsage,
  		loadAvg:                  -1.0, // negative value indicates uninitialized.
@@ -103,7 +104,7 @@ index 2384a3a..2f1e5fb 100644
  	if *enableLoadReader {
  		// Create cpu load reader.
  		loadReader, err := cpuload.New()
-@@ -385,7 +397,7 @@ func (self *containerData) nextHousekeeping(lastHousekeeping time.Time) time.Tim
+@@ -374,7 +387,7 @@ func (self *containerData) nextHousekeeping(lastHousekeeping time.Time) time.Tim
  }
  
  // TODO(vmarmol): Implement stats collecting as a custom collector.
@@ -112,7 +113,7 @@ index 2384a3a..2f1e5fb 100644
  	// Start any background goroutines - must be cleaned up in c.handler.Cleanup().
  	c.handler.Start()
  	defer c.handler.Cleanup()
-@@ -405,7 +417,6 @@ func (c *containerData) housekeeping() {
+@@ -394,7 +407,6 @@ func (c *containerData) housekeeping() {
  		longHousekeeping = *HousekeepingInterval / 2
  	}
  
@@ -120,7 +121,7 @@ index 2384a3a..2f1e5fb 100644
  	glog.V(3).Infof("Start housekeeping for container %q\n", c.info.Name)
  	lastHousekeeping := time.Now()
  	for {
-@@ -416,7 +427,7 @@ func (c *containerData) housekeeping() {
+@@ -405,7 +417,7 @@ func (c *containerData) housekeeping() {
  		default:
  			// Perform housekeeping.
  			start := time.Now()
@@ -129,7 +130,7 @@ index 2384a3a..2f1e5fb 100644
  
  			// Log if housekeeping took too long.
  			duration := time.Since(start)
-@@ -464,11 +475,13 @@ func (c *containerData) housekeeping() {
+@@ -453,11 +465,13 @@ func (c *containerData) housekeeping() {
  	}
  }
  
@@ -145,7 +146,7 @@ index 2384a3a..2f1e5fb 100644
  		if err != nil {
  			if c.allowErrorLogging() {
  				glog.Infof("Failed to update stats for container \"%s\": %s", c.info.Name, err)
-@@ -480,9 +493,9 @@ func (c *containerData) housekeepingTick() {
+@@ -469,9 +483,9 @@ func (c *containerData) housekeepingTick() {
  	select {
  	case <-done:
  		// Nothing to do
@@ -157,7 +158,7 @@ index 2384a3a..2f1e5fb 100644
  		pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
  		panic("Aborting!")
  	}
-@@ -515,7 +528,10 @@ func (c *containerData) updateSpec() error {
+@@ -504,7 +518,10 @@ func (c *containerData) updateSpec() error {
  // Calculate new smoothed load average using the new sample of runnable threads.
  // The decay used ensures that the load will stabilize on a new constant value within
  // 10 seconds.
@@ -169,7 +170,7 @@ index 2384a3a..2f1e5fb 100644
  	if c.loadAvg < 0 {
  		c.loadAvg = float64(newLoad) // initialize to the first seen sample for faster stabilization.
  	} else {
-@@ -523,6 +539,69 @@ func (c *containerData) updateLoad(newLoad uint64) {
+@@ -512,6 +529,69 @@ func (c *containerData) updateLoad(newLoad uint64) {
  	}
  }
  
@@ -239,7 +240,7 @@ index 2384a3a..2f1e5fb 100644
  func (c *containerData) updateStats() error {
  	stats, statsErr := c.handler.GetStats()
  	if statsErr != nil {
-@@ -537,19 +616,14 @@ func (c *containerData) updateStats() error {
+@@ -526,19 +606,14 @@ func (c *containerData) updateStats() error {
  	if stats == nil {
  		return statsErr
  	}

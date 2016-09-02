@@ -1,4 +1,4 @@
-From 18e4b9afe10d26309427c55c07bc7342ad783a29 Mon Sep 17 00:00:00 2001
+From a54221f3d3e985a36b984aeec7045888952410f9 Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Mon, 4 Apr 2016 17:56:53 +0200
 Subject: [PATCH] Include uninterruptible and IO wait tasks in LA
@@ -10,10 +10,10 @@ counter-intuitive to the concept of the load average).
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/manager/container.go b/manager/container.go
-index baae002..dffd50f 100644
+index d5f4bb4..1309ade 100644
 --- a/manager/container.go
 +++ b/manager/container.go
-@@ -527,7 +527,7 @@ func (c *containerData) updateStats() error {
+@@ -516,7 +516,7 @@ func (c *containerData) updateStats() error {
  				return fmt.Errorf("failed to get load stat for %q - path %q, error %s", c.info.Name, path, err)
  			}
  			stats.TaskStats = loadStats

@@ -1,4 +1,4 @@
-From b0b131b72ee9f5489a187714e464856dfa927beb Mon Sep 17 00:00:00 2001
+From 334d5df7d2ad59b1eedd89e9953ccb102dc803ef Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Wed, 30 Mar 2016 10:17:58 +0200
 Subject: [PATCH] Add support for UNIX sockets
@@ -8,7 +8,7 @@ Subject: [PATCH] Add support for UNIX sockets
  1 file changed, 35 insertions(+), 6 deletions(-)
 
 diff --git a/cadvisor.go b/cadvisor.go
-index 6f6a0ad..5cd4f89 100644
+index f52ac90..ab58f8c 100644
 --- a/cadvisor.go
 +++ b/cadvisor.go
 @@ -17,6 +17,7 @@ package main
@@ -27,7 +27,7 @@ index 6f6a0ad..5cd4f89 100644
  var argIp = flag.String("listen_ip", "", "IP to listen on, defaults to all IPs")
  var argPort = flag.Int("port", 8080, "port to listen")
  var maxProcs = flag.Int("max_procs", 0, "max number of CPUs that can be used simultaneously. Less than 1 for default (number of cores).")
-@@ -137,13 +139,37 @@ func main() {
+@@ -146,13 +148,37 @@ func main() {
  		glog.Fatalf("Failed to start container manager: %v", err)
  	}
  
@@ -70,7 +70,7 @@ index 6f6a0ad..5cd4f89 100644
  }
  
  func setMaxProcs() {
-@@ -164,16 +190,19 @@ func setMaxProcs() {
+@@ -173,16 +199,19 @@ func setMaxProcs() {
  	}
  }
  
