@@ -1,7 +1,7 @@
-From bc44ba8296bb789c0187b44c1e751687d61e3686 Mon Sep 17 00:00:00 2001
+From be095e60b33decaccf5b72a57f5ef4a6a2de320f Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
 Date: Thu, 1 Sep 2016 17:50:41 +0200
-Subject: [PATCH] WIP - go-dockerclient 1.6 compatibility
+Subject: [PATCH] go-dockerclient 1.6 compatibility
 
 https://github.com/google/cadvisor/issues/1214
 ---
