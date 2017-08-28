@@ -1,6 +1,6 @@
-From da76e5281e62df17ac5faa846827a395cbd6834b Mon Sep 17 00:00:00 2001
+From c6a025d6563c171502e0dbc10d114023aaafd39b Mon Sep 17 00:00:00 2001
 From: Thomas Orozco <thomas@orozco.fr>
-Date: Wed, 16 Nov 2016 12:45:02 +0100
+Date: Mon, 28 Aug 2017 10:11:42 +0200
 Subject: [PATCH] Push CPU Throttled Time to InfluxDB
 
 ---
@@ -10,14 +10,14 @@ Subject: [PATCH] Push CPU Throttled Time to InfluxDB
  3 files changed, 10 insertions(+), 1 deletion(-)
 
 diff --git a/container/libcontainer/helpers.go b/container/libcontainer/helpers.go
-index e3d3a09..4c389a3 100644
+index e3d3a09..8016afd 100644
 --- a/container/libcontainer/helpers.go
 +++ b/container/libcontainer/helpers.go
 @@ -357,9 +357,10 @@ func DiskStatsCopy(blkio_stats []cgroups.BlkioStatEntry) (stat []info.PerDiskSta
  func toContainerStats0(s *cgroups.Stats, ret *info.ContainerStats) {
  	ret.Cpu.Usage.User = s.CpuStats.CpuUsage.UsageInUsermode
  	ret.Cpu.Usage.System = s.CpuStats.CpuUsage.UsageInKernelmode
-+	ret.Cpu.Usage.Throttled = s.CpuStats.ThrottlingData.ThrottledTime;
++	ret.Cpu.Usage.Throttled = s.CpuStats.ThrottlingData.ThrottledTime
 +
  	n := len(s.CpuStats.CpuUsage.PercpuUsage)
  	ret.Cpu.Usage.PerCpu = make([]uint64, n)
